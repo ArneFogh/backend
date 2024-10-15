@@ -37,6 +37,10 @@ function calculateHmacSha1(params, secret) {
   return hmac.digest('hex');
 }
 
+app.get('/', (req, res) => {
+  res.send('Backend is running!');
+});
+
 app.post("/api/prepare-payment", (req, res) => {
   try {
     const { totalWithShipping } = req.body;
