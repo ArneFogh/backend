@@ -15,8 +15,17 @@ const gatewayId = process.env.ONPAY_GATEWAY_ID;
 const secret = process.env.ONPAY_SECRET;
 
 // CORS configuration
+const allowedOrigins = ['https://welovebirds.dk', 'https://api.welovebirds.dk', 'http://localhost:3000'];
+
 app.use(cors({
-  origin: frontendUrl,
+  origin: function(origin, callback) {
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.indexOf(origin) === -1) {
+      var msg = 'The CORS policy for this site does not allow access from the specified Origin.';
+      return callback(new Error(msg), false);
+    }
+    return callback(null, true);
+  },
   optionsSuccessStatus: 200
 }));
 
@@ -125,7 +134,7 @@ app.get("/api/homepage", async (req, res) => {
     res.json(data);
   } catch (error) {
     console.error("Error fetching homepage data:", error);
-    res.status(500).json({ message: "Error fetching homepage data" });
+    res.status(500).json({ message: "Error fetching homepage data", error: error.message });
   }
 });
 
@@ -420,6 +429,6 @@ app.get("/api/purchases/:userId", async (req, res) => {
   }
 });
 
-app.listen(5001, () => {
+app.listen(5001, '0.0.0.0', () => {
   console.log("Server started on port 5001");
 });
