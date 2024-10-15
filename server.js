@@ -1,23 +1,28 @@
 require('dotenv').config();
-const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
-
-
 const express = require("express");
 const cors = require("cors");
 const bodyParser = require("body-parser");
 const crypto = require("crypto");
+const { sanityClient, urlFor } = require('./sanityClient');
+const { v4: uuidv4 } = require('uuid');
 
 const app = express();
-app.use(cors());
-app.use(bodyParser.json());
 
+// Environment variables
+const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+const port = process.env.PORT || 5001;
 const gatewayId = process.env.ONPAY_GATEWAY_ID;
 const secret = process.env.ONPAY_SECRET;
 
-// Optional: Remove these console logs after confirming the values
-console.log('ONPAY_GATEWAY_ID:', gatewayId);
-console.log('ONPAY_SECRET:', secret ? 'Loaded' : 'Not Loaded');
+// CORS configuration
+app.use(cors({
+  origin: frontendUrl,
+  optionsSuccessStatus: 200
+}));
 
+app.use(bodyParser.json());
+
+// Helper function for HMAC calculation
 function calculateHmacSha1(params, secret) {
   const sortedParams = Object.keys(params)
     .filter(key => key.startsWith('onpay_') && key !== 'onpay_hmac_sha1')
@@ -57,11 +62,7 @@ app.post("/api/prepare-payment", (req, res) => {
       onpay_accepturl: acceptUrl,
     };
 
-    console.log("Params before HMAC calculation:", params);
-
     const hmacSha1 = calculateHmacSha1(params, secret);
-
-    console.log("Calculated HMAC:", hmacSha1);
 
     res.json({
       gatewayId: params.onpay_gatewayid,
@@ -111,7 +112,6 @@ app.get("/api/verify-payment", (req, res) => {
   }
 });
 
-const { sanityClient, urlFor } = require('./sanityClient');
 
 // Add this route to your existing server.js file
 app.get("/api/homepage", async (req, res) => {
@@ -318,7 +318,6 @@ app.get("/api/products/:id", async (req, res) => {
   }
 });
 
-const { v4: uuidv4 } = require('uuid');
 
 // Opret eller opdater et køb
 app.post("/api/purchases", async (req, res) => {
