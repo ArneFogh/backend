@@ -1,40 +1,49 @@
-require('dotenv').config();
+require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const bodyParser = require("body-parser");
 const crypto = require("crypto");
-const { sanityClient, urlFor } = require('./sanityClient');
-const { v4: uuidv4 } = require('uuid');
+const { sanityClient, urlFor } = require("./sanityClient");
+const { v4: uuidv4 } = require("uuid");
 
 const app = express();
 
 // Environment variables
-const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
 const port = process.env.PORT || 5001;
 const gatewayId = process.env.ONPAY_GATEWAY_ID;
 const secret = process.env.ONPAY_SECRET;
+const orderLocks = new Map();
 
 // CORS configuration
-const allowedOrigins = ['https://welovebirds.dk', 'https://api.welovebirds.dk', 'http://localhost:3000'];
+const allowedOrigins = [
+  "https://welovebirds.dk",
+  "https://api.welovebirds.dk",
+  "http://localhost:3000",
+];
 
-app.use(cors({
-  origin: function(origin, callback) {
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.indexOf(origin) === -1) {
-      var msg = 'The CORS policy for this site does not allow access from the specified Origin.';
-      return callback(new Error(msg), false);
-    }
-    return callback(null, true);
-  },
-  optionsSuccessStatus: 200
-}));
+app.use(
+  cors({
+    origin: function (origin, callback) {
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.indexOf(origin) === -1) {
+        var msg =
+          "The CORS policy for this site does not allow access from the specified Origin.";
+        return callback(new Error(msg), false);
+      }
+      return callback(null, true);
+    },
+    optionsSuccessStatus: 200,
+  })
+);
 
 app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
 
 // Helper function for HMAC calculation
 function calculateHmacSha1(params, secret) {
   const sortedParams = Object.keys(params)
-    .filter(key => key.startsWith('onpay_') && key !== 'onpay_hmac_sha1')
+    .filter((key) => key.startsWith("onpay_") && key !== "onpay_hmac_sha1")
     .sort()
     .reduce((obj, key) => {
       obj[key] = params[key];
@@ -43,43 +52,105 @@ function calculateHmacSha1(params, secret) {
 
   const queryString = Object.entries(sortedParams)
     .map(([key, value]) => `${key}=${encodeURIComponent(value)}`)
-    .join('&')
+    .join("&")
     .toLowerCase();
 
-  const hmac = crypto.createHmac('sha1', secret);
+  const hmac = crypto.createHmac("sha1", secret);
   hmac.update(queryString);
-  return hmac.digest('hex');
+  return hmac.digest("hex");
 }
 
-app.get('/', (req, res) => {
-  res.send('Backend is running!');
+app.get("/", (req, res) => {
+  res.send("Backend is running!");
+});
+
+app.post("/api/update-order-status", async (req, res) => {
+  const { orderNumber } = req.body;
+
+  if (orderLocks.get(orderNumber)) {
+    return res.status(409).json({ message: "Order update in progress" });
+  }
+
+  orderLocks.set(orderNumber, true);
+
+  // Automatisk frigørelse af låsen efter 30 sekunder
+  setTimeout(() => {
+    orderLocks.delete(orderNumber);
+  }, 30000);
+
+  try {
+    const { orderNumber, status, onpayDetails } = req.body;
+
+    // Forsøg først at hente den eksisterende ordre
+    let existingOrder = await sanityClient.fetch(
+      `*[_type == "purchase" && orderNumber == $orderNumber][0]`,
+      { orderNumber }
+    );
+
+    let updatedOrder;
+
+    if (existingOrder) {
+      // Hvis ordren eksisterer, opdater den
+      updatedOrder = await sanityClient
+        .patch(existingOrder._id)
+        .set({
+          status,
+          onpayDetails,
+          updatedAt: new Date().toISOString(),
+        })
+        .commit();
+    } else {
+      // Hvis ordren ikke eksisterer, opret en ny
+      updatedOrder = await sanityClient.create({
+        _type: "purchase",
+        orderNumber,
+        status,
+        onpayDetails,
+        totalAmount: parseInt(onpayDetails.onpay_amount) / 100,
+        currency:
+          onpayDetails.onpay_currency === "208"
+            ? "DKK"
+            : onpayDetails.onpay_currency,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+    }
+
+    console.log("Updated order:", updatedOrder);
+
+    res.json({ status: updatedOrder.status, orderDetails: updatedOrder });
+  } catch (error) {
+    console.error("Error updating order status:", error);
+    res.status(500).json({ message: "Failed to update order status" });
+  } finally {
+    orderLocks.delete(orderNumber);
+  }
 });
 
 app.post("/api/prepare-payment", (req, res) => {
   try {
-    const { totalWithShipping } = req.body;
+    const { totalWithShipping, orderNumber } = req.body;
     const currency = "DKK";
     const amount = Math.round(totalWithShipping * 100).toString();
-    const reference = `ORDER-${Date.now()}`;
-    const acceptUrl = `${frontendUrl}/order-confirmation`;
+    const acceptUrl = `${process.env.FRONTEND_URL}/order-confirmation/${orderNumber}`;
+    const callbackUrl = `${process.env.BACKEND_URL}/api/payment-callback`;
+    const declineUrl = `${process.env.FRONTEND_URL}/payment-failed/${orderNumber}`;
 
     const params = {
-      onpay_gatewayid: gatewayId,
+      onpay_gatewayid: process.env.ONPAY_GATEWAY_ID,
       onpay_currency: currency,
       onpay_amount: amount,
-      onpay_reference: reference,
+      onpay_reference: orderNumber,
       onpay_accepturl: acceptUrl,
+      onpay_callbackurl: callbackUrl,
+      onpay_declineurl: declineUrl,
     };
 
-    const hmacSha1 = calculateHmacSha1(params, secret);
+    const hmacSha1 = calculateHmacSha1(params, process.env.ONPAY_SECRET);
 
     res.json({
-      gatewayId: params.onpay_gatewayid,
-      currency: params.onpay_currency,
-      amount: params.onpay_amount,
-      reference: params.onpay_reference,
-      acceptUrl: params.onpay_accepturl,
-      hmacSha1: hmacSha1,
+      ...params,
+      onpay_hmac_sha1: hmacSha1,
     });
   } catch (error) {
     console.error("Error in /api/prepare-payment:", error);
@@ -103,7 +174,8 @@ app.get("/api/verify-payment", (req, res) => {
     if (calculatedHmac === receivedHmac) {
       const verifiedPaymentDetails = {
         amount: params.onpay_amount,
-        currency: params.onpay_currency === "208" ? "DKK" : params.onpay_currency,
+        currency:
+          params.onpay_currency === "208" ? "DKK" : params.onpay_currency,
         reference: params.onpay_reference,
         status: params.onpay_errorcode === "0" ? "Success" : "Failed",
         errorCode: params.onpay_errorcode,
@@ -121,7 +193,6 @@ app.get("/api/verify-payment", (req, res) => {
   }
 });
 
-
 // Add this route to your existing server.js file
 app.get("/api/homepage", async (req, res) => {
   try {
@@ -134,10 +205,11 @@ app.get("/api/homepage", async (req, res) => {
     res.json(data);
   } catch (error) {
     console.error("Error fetching homepage data:", error);
-    res.status(500).json({ message: "Error fetching homepage data", error: error.message });
+    res
+      .status(500)
+      .json({ message: "Error fetching homepage data", error: error.message });
   }
 });
-
 
 // Tilføj denne rute til din eksisterende server.js fil
 app.get("/api/aboutus", async (req, res) => {
@@ -159,9 +231,9 @@ app.get("/api/aboutus", async (req, res) => {
 
 app.get("/api/image", async (req, res) => {
   const { imageId } = req.query;
-  
+
   if (!imageId) {
-    return res.status(400).send('Image ID is required');
+    return res.status(400).send("Image ID is required");
   }
 
   try {
@@ -169,7 +241,7 @@ app.get("/api/image", async (req, res) => {
     res.redirect(imageUrl);
   } catch (error) {
     console.error("Error generating image URL:", error);
-    res.status(500).send('Error generating image URL');
+    res.status(500).send("Error generating image URL");
   }
 });
 
@@ -184,14 +256,16 @@ app.get("/api/terms", async (req, res) => {
     res.json(data);
   } catch (error) {
     console.error("Error fetching terms and conditions data:", error);
-    res.status(500).json({ message: "Error fetching terms and conditions data" });
+    res
+      .status(500)
+      .json({ message: "Error fetching terms and conditions data" });
   }
 });
 
 app.post("/api/users", async (req, res) => {
   try {
     const userData = req.body;
-    
+
     // Tjek om brugeren allerede eksisterer
     const existingUser = await sanityClient.fetch(
       `*[_type == "user" && auth0Id == $auth0Id][0]`,
@@ -254,7 +328,7 @@ app.get("/api/users/:auth0Id", async (req, res) => {
 app.delete("/api/users/:auth0Id", async (req, res) => {
   try {
     const { auth0Id } = req.params;
-    
+
     // Først, hent Sanity bruger-ID baseret på Auth0 ID
     const user = await sanityClient.fetch(
       `*[_type == "user" && auth0Id == $auth0Id][0]{ _id }`,
@@ -268,12 +342,18 @@ app.delete("/api/users/:auth0Id", async (req, res) => {
     const sanityUserId = user._id;
 
     // 1. Slet brugerens opslag
-    await sanityClient.delete({query: '*[_type == "userPost" && userId == $sanityUserId]', params: {sanityUserId}});
+    await sanityClient.delete({
+      query: '*[_type == "userPost" && userId == $sanityUserId]',
+      params: { sanityUserId },
+    });
 
     // 2. Opdater køb til at fjerne referencen til brugeren
     await sanityClient
-      .patch({query: '*[_type == "purchase" && user._ref == $sanityUserId]', params: {sanityUserId}})
-      .unset(['user'])
+      .patch({
+        query: '*[_type == "purchase" && user._ref == $sanityUserId]',
+        params: { sanityUserId },
+      })
+      .unset(["user"])
       .commit();
 
     // 3. Slet brugeren
@@ -298,7 +378,7 @@ app.get("/api/products", async (req, res) => {
     const products = await sanityClient.fetch(query);
     res.json(products);
   } catch (error) {
-    console.error('Error fetching products:', error);
+    console.error("Error fetching products:", error);
     res.status(500).json({ message: "Failed to fetch products" });
   }
 });
@@ -322,17 +402,17 @@ app.get("/api/products/:id", async (req, res) => {
     }
     res.json(product);
   } catch (error) {
-    console.error('Error fetching product:', error);
+    console.error("Error fetching product:", error);
     res.status(500).json({ message: "Failed to fetch product" });
   }
 });
-
 
 // Opret eller opdater et køb
 app.post("/api/purchases", async (req, res) => {
   try {
     const purchaseData = req.body;
-    const { orderNumber, userId, totalAmount, currency, status, date, items } = purchaseData;
+    const { orderNumber, userId, totalAmount, currency, status, date, items } =
+      purchaseData;
 
     // Find Sanity bruger-ID baseret på Auth0 ID
     const user = await sanityClient.fetch(
@@ -387,7 +467,9 @@ app.post("/api/purchases", async (req, res) => {
     res.json(newPurchase);
   } catch (error) {
     console.error("Error creating/updating purchase in Sanity:", error);
-    res.status(500).json({ message: "Failed to create/update purchase in Sanity" });
+    res
+      .status(500)
+      .json({ message: "Failed to create/update purchase in Sanity" });
   }
 });
 
@@ -429,6 +511,100 @@ app.get("/api/purchases/:userId", async (req, res) => {
   }
 });
 
-app.listen(5001, '0.0.0.0', () => {
-  console.log("Server started on port 5001");
+app.post("/api/create-temp-order", async (req, res) => {
+  try {
+    const { cartItems, shippingInfo, totalAmount } = req.body;
+    const orderNumber = `ORDER-${Date.now()}`;
+
+    const tempOrder = await sanityClient.create({
+      _type: "tempOrder",
+      orderNumber: orderNumber,
+      cartItems: cartItems,
+      shippingInfo: shippingInfo,
+      totalAmount: totalAmount,
+      status: "pending",
+      createdAt: new Date().toISOString(),
+    });
+
+    res.json({ orderNumber: tempOrder.orderNumber });
+  } catch (error) {
+    console.error("Error creating temporary order:", error);
+    res.status(500).json({ message: "Failed to create temporary order" });
+  }
+});
+
+app.post("/api/payment-callback", async (req, res) => {
+  try {
+    const params = req.body;
+    const calculatedHmac = calculateHmacSha1(params, secret);
+    const receivedHmac = params.onpay_hmac_sha1;
+
+    if (calculatedHmac !== receivedHmac) {
+      console.error("HMAC verification failed");
+      return res.status(400).send("HMAC verification failed");
+    }
+
+    const orderNumber = params.onpay_reference;
+    const status = params.onpay_errorcode === "0" ? "Success" : "Failed";
+
+    // Genbruger logikken fra update-order-status
+    let order = await sanityClient.fetch(
+      `*[_type == "purchase" && orderNumber == $orderNumber][0]`,
+      { orderNumber }
+    );
+
+    if (order) {
+      order = await sanityClient
+        .patch(order._id)
+        .set({ status, onpayDetails: params })
+        .commit();
+    } else {
+      order = await sanityClient.create({
+        _type: "purchase",
+        orderNumber,
+        status,
+        onpayDetails: params,
+        totalAmount: parseInt(params.onpay_amount) / 100,
+        currency:
+          params.onpay_currency === "208" ? "DKK" : params.onpay_currency,
+        createdAt: new Date().toISOString(),
+      });
+    }
+
+    res.status(200).send("OK");
+  } catch (error) {
+    console.error("Error processing payment callback:", error);
+    res.status(500).send("Internal Server Error");
+  }
+});
+
+app.get("/api/order-status/:orderNumber", async (req, res) => {
+  try {
+    const { orderNumber } = req.params;
+    const purchase = await sanityClient.fetch(
+      `*[_type == "purchase" && orderNumber == $orderNumber][0]`,
+      { orderNumber }
+    );
+
+    if (purchase) {
+      res.json({ status: purchase.status, orderDetails: purchase });
+    } else {
+      const tempOrder = await sanityClient.fetch(
+        `*[_type == "tempOrder" && orderNumber == $orderNumber][0]`,
+        { orderNumber }
+      );
+      if (tempOrder) {
+        res.json({ status: "pending", orderDetails: tempOrder });
+      } else {
+        res.status(404).json({ message: "Order not found" });
+      }
+    }
+  } catch (error) {
+    console.error("Error fetching order status:", error);
+    res.status(500).json({ message: "Failed to fetch order status" });
+  }
+});
+
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
 });
