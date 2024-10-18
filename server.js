@@ -39,6 +39,12 @@ app.use(
 
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
+app.use(express.json());
+
+app.use((req, res, next) => {
+  console.log(`Received ${req.method} request to ${req.url}`);
+  next();
+});
 
 // Helper function for HMAC calculation
 function calculateHmacSha1(params, secret) {
@@ -533,49 +539,69 @@ app.post("/api/create-temp-order", async (req, res) => {
   }
 });
 
-app.post("/api/payment-callback", async (req, res) => {
-  try {
-    const params = req.body;
-    const calculatedHmac = calculateHmacSha1(params, secret);
-    const receivedHmac = params.onpay_hmac_sha1;
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 5000; // 5 seconds
 
-    if (calculatedHmac !== receivedHmac) {
-      console.error("HMAC verification failed");
-      return res.status(400).send("HMAC verification failed");
+async function processCallback(data, retryCount = 0) {
+  try {
+    const { onpay_reference, onpay_amount, onpay_currency, onpay_errorcode } =
+      data;
+    const status = onpay_errorcode === "0" ? "Success" : "Failed";
+
+    // Verificer HMAC
+    const calculatedHmac = calculateHmacSha1(data, process.env.ONPAY_SECRET);
+    if (calculatedHmac !== data.onpay_hmac_sha1) {
+      throw new Error("HMAC verification failed");
     }
 
-    const orderNumber = params.onpay_reference;
-    const status = params.onpay_errorcode === "0" ? "Success" : "Failed";
-
-    // Genbruger logikken fra update-order-status
+    // Find eller opret ordren i Sanity
     let order = await sanityClient.fetch(
       `*[_type == "purchase" && orderNumber == $orderNumber][0]`,
-      { orderNumber }
+      { orderNumber: onpay_reference }
     );
 
-    if (order) {
-      order = await sanityClient
-        .patch(order._id)
-        .set({ status, onpayDetails: params })
-        .commit();
-    } else {
+    if (!order) {
       order = await sanityClient.create({
         _type: "purchase",
-        orderNumber,
-        status,
-        onpayDetails: params,
-        totalAmount: parseInt(params.onpay_amount) / 100,
-        currency:
-          params.onpay_currency === "208" ? "DKK" : params.onpay_currency,
+        orderNumber: onpay_reference,
+        status: status,
+        totalAmount: parseInt(onpay_amount) / 100,
+        currency: onpay_currency === "208" ? "DKK" : onpay_currency,
+        onpayDetails: data,
         createdAt: new Date().toISOString(),
       });
+      console.log("New order created:", order);
+    } else {
+      order = await sanityClient
+        .patch(order._id)
+        .set({
+          status: status,
+          onpayDetails: data,
+          updatedAt: new Date().toISOString(),
+        })
+        .commit();
+      console.log("Existing order updated:", order);
     }
-
-    res.status(200).send("OK");
   } catch (error) {
-    console.error("Error processing payment callback:", error);
-    res.status(500).send("Internal Server Error");
+    console.error("Error processing callback:", error);
+    if (retryCount < MAX_RETRIES) {
+      console.log(`Retry attempt ${retryCount + 1}`);
+      setTimeout(() => processCallback(data, retryCount + 1), RETRY_DELAY);
+    } else {
+      console.error("Max retries reached. Failed to process callback:", error);
+      // Her kunne du implementere en alarm eller notifikation til dit team
+    }
   }
+}
+
+app.post("/api/payment-callback", (req, res) => {
+  console.log("Received callback from OnPay:", req.body);
+
+  // Respond immediately to OnPay
+  res.status(200).send("OK");
+
+  // Process the callback asynchronously
+  processCallback(req.body);
 });
 
 app.get("/api/order-status/:orderNumber", async (req, res) => {
@@ -603,6 +629,23 @@ app.get("/api/order-status/:orderNumber", async (req, res) => {
     console.error("Error fetching order status:", error);
     res.status(500).json({ message: "Failed to fetch order status" });
   }
+});
+
+app.get("/api/order-status/:orderNumber", async (req, res) => {
+  const { orderNumber } = req.params;
+  const order = await sanityClient.fetch(
+    `*[_type == "purchase" && orderNumber == $orderNumber][0]`,
+    { orderNumber }
+  );
+  res.json({ status: order ? order.status : "Pending" });
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught Exception:", error);
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("Unhandled Rejection at:", promise, "reason:", reason);
 });
 
 app.listen(port, () => {
