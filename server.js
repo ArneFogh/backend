@@ -4,9 +4,39 @@ const cors = require("cors");
 const bodyParser = require("body-parser");
 const crypto = require("crypto");
 const { sanityClient, urlFor } = require("./sanityClient");
+const {
+  checkPendingOrders,
+  stopPendingOrdersCheck,
+} = require("./Onpay-api/orderStatusChecker");
 const { v4: uuidv4 } = require("uuid");
+const axios = require("axios");
+
+function validateEnvVariables() {
+  const requiredEnvVars = [
+    "FRONTEND_URL",
+    "ONPAY_GATEWAY_ID",
+    "ONPAY_SECRET",
+    "SANITY_PROJECT_ID",
+    "SANITY_SECRET_TOKEN",
+    "BACKEND_URL",
+  ];
+
+  for (const envVar of requiredEnvVars) {
+    if (!process.env[envVar]) {
+      console.error(
+        `Error: Required environment variable ${envVar} is not set`
+      );
+      process.exit(1);
+    }
+  }
+  console.log("All required environment variables are set.");
+}
+
+// Kald denne funktion før du initialiserer din Express app
+validateEnvVariables();
 
 const app = express();
+checkPendingOrders();
 
 // Environment variables
 const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
@@ -20,7 +50,29 @@ const allowedOrigins = [
   "https://welovebirds.dk",
   "https://api.welovebirds.dk",
   "http://localhost:3000",
+  "https://onpay.io",
 ];
+
+// Valider miljøvariabler ved opstart
+const requiredEnvVars = [
+  "FRONTEND_URL",
+  "ONPAY_GATEWAY_ID",
+  "ONPAY_SECRET",
+  "SANITY_PROJECT_ID",
+  "SANITY_SECRET_TOKEN",
+];
+for (const envVar of requiredEnvVars) {
+  if (!process.env[envVar]) {
+    console.error(`Required environment variable ${envVar} is not set`);
+    process.exit(1);
+  }
+}
+
+// Central fejlhåndtering
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).send("Something broke!");
+});
 
 app.use(
   cors({
@@ -45,26 +97,6 @@ app.use((req, res, next) => {
   console.log(`Received ${req.method} request to ${req.url}`);
   next();
 });
-
-// Helper function for HMAC calculation
-function calculateHmacSha1(params, secret) {
-  const sortedParams = Object.keys(params)
-    .filter((key) => key.startsWith("onpay_") && key !== "onpay_hmac_sha1")
-    .sort()
-    .reduce((obj, key) => {
-      obj[key] = params[key];
-      return obj;
-    }, {});
-
-  const queryString = Object.entries(sortedParams)
-    .map(([key, value]) => `${key}=${encodeURIComponent(value)}`)
-    .join("&")
-    .toLowerCase();
-
-  const hmac = crypto.createHmac("sha1", secret);
-  hmac.update(queryString);
-  return hmac.digest("hex");
-}
 
 app.get("/", (req, res) => {
   res.send("Backend is running!");
@@ -517,6 +549,28 @@ app.get("/api/purchases/:userId", async (req, res) => {
   }
 });
 
+app.post("/api/create-pre-order", async (req, res) => {
+  try {
+    const { cartItems, shippingInfo, totalAmount } = req.body;
+    const orderNumber = `ORDER-${Date.now()}`;
+
+    const preOrder = await sanityClient.create({
+      _type: "purchase",
+      orderNumber: orderNumber,
+      cartItems: cartItems,
+      shippingInfo: shippingInfo,
+      totalAmount: totalAmount,
+      status: "initiated",
+      createdAt: new Date().toISOString(),
+    });
+
+    res.json({ orderNumber: preOrder.orderNumber });
+  } catch (error) {
+    console.error("Error creating pre-order:", error);
+    res.status(500).json({ message: "Failed to create pre-order" });
+  }
+});
+
 app.post("/api/create-temp-order", async (req, res) => {
   try {
     const { cartItems, shippingInfo, totalAmount } = req.body;
@@ -539,70 +593,125 @@ app.post("/api/create-temp-order", async (req, res) => {
   }
 });
 
-const MAX_RETRIES = 3;
-const RETRY_DELAY = 5000; // 5 seconds
+const MAX_RETRIES = 5;
+const RETRY_DELAYS = [10000, 60000, 360000, 720000, 1440000]; // 10 min, 1 hour, 6 hours, 12 hours, 24 hours
 
-async function processCallback(data, retryCount = 0) {
-  try {
-    const { onpay_reference, onpay_amount, onpay_currency, onpay_errorcode } =
-      data;
-    const status = onpay_errorcode === "0" ? "Success" : "Failed";
-
-    // Verificer HMAC
-    const calculatedHmac = calculateHmacSha1(data, process.env.ONPAY_SECRET);
-    if (calculatedHmac !== data.onpay_hmac_sha1) {
-      throw new Error("HMAC verification failed");
-    }
-
-    // Find eller opret ordren i Sanity
-    let order = await sanityClient.fetch(
-      `*[_type == "purchase" && orderNumber == $orderNumber][0]`,
-      { orderNumber: onpay_reference }
-    );
-
-    if (!order) {
-      order = await sanityClient.create({
-        _type: "purchase",
-        orderNumber: onpay_reference,
-        status: status,
-        totalAmount: parseInt(onpay_amount) / 100,
-        currency: onpay_currency === "208" ? "DKK" : onpay_currency,
-        onpayDetails: data,
-        createdAt: new Date().toISOString(),
-      });
-      console.log("New order created:", order);
-    } else {
-      order = await sanityClient
-        .patch(order._id)
-        .set({
-          status: status,
-          onpayDetails: data,
-          updatedAt: new Date().toISOString(),
-        })
-        .commit();
-      console.log("Existing order updated:", order);
-    }
-  } catch (error) {
-    console.error("Error processing callback:", error);
-    if (retryCount < MAX_RETRIES) {
-      console.log(`Retry attempt ${retryCount + 1}`);
-      setTimeout(() => processCallback(data, retryCount + 1), RETRY_DELAY);
-    } else {
-      console.error("Max retries reached. Failed to process callback:", error);
-      // Her kunne du implementere en alarm eller notifikation til dit team
-    }
-  }
-}
-
-app.post("/api/payment-callback", (req, res) => {
+app.post("/api/payment-callback", async (req, res) => {
   console.log("Received callback from OnPay:", req.body);
 
   // Respond immediately to OnPay
   res.status(200).send("OK");
 
-  // Process the callback asynchronously
-  processCallback(req.body);
+  try {
+    const result = await processCallback(req.body);
+    if (result) {
+      console.log("Callback processed successfully");
+    } else {
+      console.error("Failed to process callback");
+    }
+  } catch (error) {
+    console.error("Error processing callback:", error);
+  }
 });
+
+async function processCallback(data) {
+  console.log("Processing callback data:", data);
+
+  try {
+    const {
+      onpay_uuid,
+      onpay_number,
+      onpay_reference,
+      onpay_amount,
+      onpay_currency,
+      onpay_errorcode,
+      onpay_hmac_sha1,
+    } = data;
+
+    // Verify HMAC
+    const calculatedHmac = calculateHmacSha1(data, process.env.ONPAY_SECRET);
+    if (calculatedHmac !== onpay_hmac_sha1) {
+      console.error("HMAC verification failed");
+      throw new Error("HMAC verification failed");
+    }
+
+    const status = onpay_errorcode === "0" ? "Success" : "Failed";
+    const amount = parseInt(onpay_amount) / 100; // Convert to major units
+
+    // Check if order exists
+    let order = await sanityClient.fetch(
+      `*[_type == "purchase" && orderNumber == $orderNumber][0]`,
+      { orderNumber: onpay_reference }
+    );
+
+    if (order) {
+      console.log(`Updating existing order: ${onpay_reference}`);
+      order = await sanityClient
+        .patch(order._id)
+        .set({
+          status: status,
+          totalAmount: amount,
+          currency: onpay_currency === "208" ? "DKK" : onpay_currency,
+          onpayDetails: {
+            uuid: onpay_uuid,
+            number: onpay_number,
+            errorCode: onpay_errorcode,
+          },
+          updatedAt: new Date().toISOString(),
+        })
+        .commit();
+    } else {
+      console.log(`Creating new order: ${onpay_reference}`);
+      order = await sanityClient.create({
+        _type: "purchase",
+        orderNumber: onpay_reference,
+        status: status,
+        totalAmount: amount,
+        currency: onpay_currency === "208" ? "DKK" : onpay_currency,
+        onpayDetails: {
+          uuid: onpay_uuid,
+          number: onpay_number,
+          errorCode: onpay_errorcode,
+        },
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+    }
+
+    console.log(`Order processed successfully: ${onpay_reference}`);
+    return true;
+  } catch (error) {
+    console.error("Error processing callback:", error);
+    // Here you might want to implement some kind of alerting system
+    // to notify you of failed callbacks
+    sendAlertToTeam("Failed to process payment callback", { data, error });
+    return false;
+  }
+}
+
+function calculateHmacSha1(params, secret) {
+  const sortedParams = Object.keys(params)
+    .filter(key => key.startsWith("onpay_") && key !== "onpay_hmac_sha1")
+    .sort()
+    .reduce((obj, key) => {
+      obj[key] = params[key];
+      return obj;
+    }, {});
+
+  const queryString = Object.entries(sortedParams)
+    .map(([key, value]) => `${key}=${encodeURIComponent(value)}`)
+    .join("&")
+    .toLowerCase();
+
+  const hmac = crypto.createHmac("sha1", secret);
+  hmac.update(queryString);
+  return hmac.digest("hex");
+}
+
+function sendAlertToTeam(message, details) {
+  // Implement your alert mechanism here (e.g., email, Slack notification, etc.)
+  console.error("ALERT:", message, details);
+}
 
 app.get("/api/order-status/:orderNumber", async (req, res) => {
   try {
@@ -640,12 +749,47 @@ app.get("/api/order-status/:orderNumber", async (req, res) => {
   res.json({ status: order ? order.status : "Pending" });
 });
 
+app.post("/api/test-callback", (req, res) => {
+  const testData = {
+    onpay_uuid: "test-uuid",
+    onpay_amount: "10000",
+    onpay_currency: "208",
+    onpay_reference: "TEST-" + Date.now(),
+    onpay_errorcode: "0",
+  };
+
+  const hmac = calculateHmacSha1(testData, process.env.ONPAY_SECRET);
+  testData.onpay_hmac_sha1 = hmac;
+
+  fetch("https://api.welovebirds.dk/api/payment-callback", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(testData),
+  })
+    .then((response) => response.text())
+    .then((result) => res.send("Test callback sent. Result: " + result))
+    .catch((error) => {
+      console.error("Error sending test callback:", error);
+      res.status(500).send("Error sending test callback");
+    });
+});
+
 process.on("uncaughtException", (error) => {
   console.error("Uncaught Exception:", error);
 });
 
 process.on("unhandledRejection", (reason, promise) => {
   console.error("Unhandled Rejection at:", promise, "reason:", reason);
+});
+
+// Graceful shutdown
+process.on("SIGTERM", () => {
+  console.log("SIGTERM signal received: closing HTTP server");
+  stopPendingOrdersCheck();
+  server.close(() => {
+    console.log("HTTP server closed");
+    process.exit(0);
+  });
 });
 
 app.listen(port, () => {
