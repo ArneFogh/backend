@@ -2,10 +2,11 @@ const cors = require("cors");
 
 const allowedOrigins = [
   "https://welovebirds.dk",
+  "https://www.welovebirds.dk", // Add this line
   "https://api.welovebirds.dk",
   "http://localhost:3000",
   "https://onpay.io",
-  "https://welovebirdssanity.sanity.studio", // Tilføjet for Sanity
+  "https://welovebirdssanity.sanity.studio",
 ];
 
 module.exports = cors({
