@@ -8,6 +8,7 @@ const {
 const { validateEnvVariables } = require("./config/envConfig");
 const corsMiddleware = require("./middleware/corsMiddleware");
 const loggingMiddleware = require("./middleware/loggingMiddleware");
+const onpayService = require('./services/onpayService');
 
 const userRoutes = require("./routes/userRoutes");
 const productRoutes = require("./routes/productRoutes");
@@ -62,3 +63,4 @@ process.on("SIGTERM", () => {
 const server = app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
+onpayService.startPolling();
