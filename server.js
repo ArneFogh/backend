@@ -21,7 +21,13 @@ checkPendingOrders();
 
 const port = process.env.PORT || 5001;
 
-app.use(corsMiddleware);
+app.use((req, res, next) => {
+  if (req.path === "/api/payment-callback") {
+    next(); // Spring CORS-middleware over
+  } else {
+    corsMiddleware(req, res, next);
+  }
+});
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.json());
