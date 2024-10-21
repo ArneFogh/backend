@@ -1,11 +1,10 @@
-// services/onpayService.js
 const axios = require("axios");
 const { sanityClient } = require("../sanityClient");
 
 let cursor = null;
-const POLLING_INTERVAL = process.env.ONPAY_POLLING_INTERVAL || 60000; // Default to 60 seconds
-const PENDING_CHECK_INTERVAL = 60 * 60 * 1000; // Check pending orders every hour
-const EVENT_AGE_LIMIT = 7 * 24 * 60 * 60 * 1000; // 7 days in milliseconds
+const POLLING_INTERVAL = 10000; // Ændret til 10 sekunder for hurtigere test
+const PENDING_CHECK_INTERVAL = 5 * 60 * 1000; // Ændret til 5 minutter for hurtigere test
+const EVENT_AGE_LIMIT = 7 * 24 * 60 * 60 * 1000; // 7 dage i millisekunder
 const processedTransactions = new Set();
 
 async function pollTransactionEvents() {
@@ -56,12 +55,22 @@ async function handleTransactionEvent(event) {
 
     const transactionData = transactionResponse.data.data;
 
-    const transactionDate = new Date(transactionData.created);
-    if (new Date() - transactionDate > EVENT_AGE_LIMIT) {
-      return;
+    if (
+      transactionData.status === "captured" ||
+      transactionData.status === "active"
+    ) {
+      const transactionDate = new Date(transactionData.created);
+      if (new Date() - transactionDate <= EVENT_AGE_LIMIT) {
+        await updateOrCreateOrder(transactionData);
+      }
+    } else if (
+      transactionData.status === "cancelled" ||
+      transactionData.status === "pre_auth"
+    ) {
+      console.log(
+        `Ignoring transaction ${transaction} with status: ${transactionData.status}`
+      );
     }
-
-    await updateOrCreateOrder(transactionData);
 
     processedTransactions.add(transaction);
 
@@ -70,16 +79,22 @@ async function handleTransactionEvent(event) {
       processedTransactions.delete(iterator.next().value);
     }
   } catch (error) {
-    console.error(
-      `Error processing transaction ${transaction}:`,
-      error.message
-    );
+    if (error.response && error.response.status === 404) {
+      console.log(
+        `Transaction ${transaction} not found. It may have been deleted.`
+      );
+    } else {
+      console.error(
+        `Error processing transaction ${transaction}:`,
+        error.message
+      );
+    }
   }
 }
 
 async function updateOrCreateOrder(transactionData) {
   const orderNumber = transactionData.order_id;
-  const newStatus = mapTransactionStatusToOrderStatus(transactionData.status);
+  const status = transactionData.status === "captured" ? "Success" : "Pending";
 
   try {
     let order = await sanityClient.fetch(
@@ -99,25 +114,25 @@ async function updateOrCreateOrder(transactionData) {
       order = await sanityClient.create({
         _type: "purchase",
         orderNumber: orderNumber,
-        status: newStatus,
+        status: status,
         onpayDetails,
         createdAt: now,
         updatedAt: now,
       });
-      console.log(`Created new order ${orderNumber} with status: ${newStatus}`);
+      console.log(`Created new order ${orderNumber} with status: ${status}`);
     } else if (
-      order.status !== newStatus ||
+      order.status !== status ||
       order.onpayDetails.status !== transactionData.status
     ) {
       await sanityClient
         .patch(order._id)
         .set({
-          status: newStatus,
+          status: status,
           onpayDetails,
           updatedAt: now,
         })
         .commit();
-      console.log(`Updated order ${orderNumber} status to ${newStatus}`);
+      console.log(`Updated order ${orderNumber} status to ${status}`);
     }
   } catch (error) {
     console.error(
@@ -127,28 +142,13 @@ async function updateOrCreateOrder(transactionData) {
   }
 }
 
-function mapTransactionStatusToOrderStatus(transactionStatus) {
-  switch (transactionStatus) {
-    case "authorized":
-    case "captured":
-      return "Success";
-    case "declined":
-    case "aborted":
-      return "Failed";
-    case "active":
-      return "Processing";
-    default:
-      return "Pending";
-  }
-}
-
 async function checkPendingOrders() {
   try {
     const pendingOrders = await sanityClient.fetch(
-      `*[_type == "purchase" && (status == "Pending" || status == "Processing")]`
+      `*[_type == "purchase" && status == "Pending"]`
     );
 
-    console.log(`Checking ${pendingOrders.length} pending/processing orders`);
+    console.log(`Checking ${pendingOrders.length} pending orders`);
 
     for (const order of pendingOrders) {
       try {
@@ -163,7 +163,23 @@ async function checkPendingOrders() {
         );
 
         const transactionData = response.data.data;
-        await updateOrCreateOrder(transactionData);
+
+        if (
+          transactionData.status === "captured" ||
+          transactionData.status === "active"
+        ) {
+          await updateOrCreateOrder(transactionData);
+        } else if (
+          ["declined", "aborted", "cancelled", "pre_auth"].includes(
+            transactionData.status
+          )
+        ) {
+          // Remove orders that are no longer pending and not captured or active
+          await sanityClient.delete(order._id);
+          console.log(
+            `Deleted non-active/captured order: ${order.orderNumber}`
+          );
+        }
       } catch (error) {
         console.error(
           `Error checking order ${order.orderNumber}:`,
