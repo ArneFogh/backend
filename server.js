@@ -1,14 +1,10 @@
 require("dotenv").config();
 const express = require("express");
 const bodyParser = require("body-parser");
-const {
-  checkPendingOrders,
-  stopPendingOrdersCheck,
-} = require("./Onpay-api/orderStatusChecker");
 const { validateEnvVariables } = require("./config/envConfig");
 const corsMiddleware = require("./middleware/corsMiddleware");
 const loggingMiddleware = require("./middleware/loggingMiddleware");
-const onpayService = require('./services/onpayService');
+const onpayService = require("./services/onpayService");
 
 const userRoutes = require("./routes/userRoutes");
 const productRoutes = require("./routes/productRoutes");
@@ -18,7 +14,6 @@ const paymentRoutes = require("./routes/paymentRoutes");
 validateEnvVariables();
 
 const app = express();
-checkPendingOrders();
 
 const port = process.env.PORT || 5001;
 
@@ -53,7 +48,6 @@ process.on("unhandledRejection", (reason, promise) => {
 
 process.on("SIGTERM", () => {
   console.log("SIGTERM signal received: closing HTTP server");
-  stopPendingOrdersCheck();
   server.close(() => {
     console.log("HTTP server closed");
     process.exit(0);
@@ -62,5 +56,5 @@ process.on("SIGTERM", () => {
 
 const server = app.listen(port, () => {
   console.log(`Server running on port ${port}`);
+  onpayService.startPolling();
 });
-onpayService.startPolling();

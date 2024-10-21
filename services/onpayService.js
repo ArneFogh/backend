@@ -4,6 +4,7 @@ const { sanityClient } = require("../sanityClient");
 
 let cursor = null;
 const POLLING_INTERVAL = process.env.ONPAY_POLLING_INTERVAL || 60000; // Default to 60 seconds
+const PENDING_CHECK_INTERVAL = 60 * 60 * 1000; // Check pending orders every hour
 const EVENT_AGE_LIMIT = 7 * 24 * 60 * 60 * 1000; // 7 days in milliseconds
 const processedTransactions = new Set();
 
@@ -141,11 +142,48 @@ function mapTransactionStatusToOrderStatus(transactionStatus) {
   }
 }
 
+async function checkPendingOrders() {
+  try {
+    const pendingOrders = await sanityClient.fetch(
+      `*[_type == "purchase" && (status == "Pending" || status == "Processing")]`
+    );
+
+    console.log(`Checking ${pendingOrders.length} pending/processing orders`);
+
+    for (const order of pendingOrders) {
+      try {
+        const response = await axios.get(
+          `https://api.onpay.io/v1/transaction/${order.onpayDetails.transactionId}`,
+          {
+            headers: {
+              Authorization: `Bearer ${process.env.ONPAY_API_KEY}`,
+              Accept: "application/json",
+            },
+          }
+        );
+
+        const transactionData = response.data.data;
+        await updateOrCreateOrder(transactionData);
+      } catch (error) {
+        console.error(
+          `Error checking order ${order.orderNumber}:`,
+          error.message
+        );
+      }
+    }
+  } catch (error) {
+    console.error("Error checking pending orders:", error.message);
+  }
+}
+
 function startPolling() {
   console.log(
     `Starting Onpay transaction polling service (Interval: ${POLLING_INTERVAL}ms)...`
   );
   pollTransactionEvents();
+
+  // Start checking pending orders periodically
+  setInterval(checkPendingOrders, PENDING_CHECK_INTERVAL);
 }
 
 module.exports = { startPolling };
