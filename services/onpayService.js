@@ -2,7 +2,7 @@ const axios = require("axios");
 const { sanityClient } = require("../sanityClient");
 
 let cursor = null;
-const POLLING_INTERVAL = 10000; // Ændret til 10 sekunder for hurtigere test
+const POLLING_INTERVAL = process.env.ONPAY_POLLING_INTERVAL || 10000; // Ændret til 10 sekunder for hurtigere test
 const PENDING_CHECK_INTERVAL = 5 * 60 * 1000; // Ændret til 5 minutter for hurtigere test
 const EVENT_AGE_LIMIT = 7 * 24 * 60 * 60 * 1000; // 7 dage i millisekunder
 const processedTransactions = new Set();
