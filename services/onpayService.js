@@ -54,41 +54,33 @@ async function handleTransactionEvent(event) {
     );
 
     const transactionData = transactionResponse.data.data;
+    const purchaseId = transactionData.order_id;
 
-    if (
-      transactionData.status === "captured" ||
-      transactionData.status === "active"
-    ) {
-      const transactionDate = new Date(transactionData.created);
-      if (new Date() - transactionDate <= EVENT_AGE_LIMIT) {
-        await updateOrCreateOrder(transactionData);
-      }
-    } else if (
-      transactionData.status === "cancelled" ||
-      transactionData.status === "pre_auth"
-    ) {
-      console.log(
-        `Ignoring transaction ${transaction} with status: ${transactionData.status}`
-      );
+    // Find purchase i Sanity
+    const purchase = await sanityClient.fetch(
+      `*[_type == "purchase" && purchaseId == $purchaseId][0]`,
+      { purchaseId }
+    );
+
+    if (purchase) {
+      // Opdater purchase status baseret på transaction status
+      await sanityClient
+        .patch(purchase._id)
+        .set({
+          status:
+            transactionData.status === "captured"
+              ? "success"
+              : transactionData.status === "declined"
+              ? "failed"
+              : "pending",
+          updatedAt: new Date().toISOString(),
+        })
+        .commit();
     }
 
     processedTransactions.add(transaction);
-
-    if (processedTransactions.size > 1000) {
-      const iterator = processedTransactions.values();
-      processedTransactions.delete(iterator.next().value);
-    }
   } catch (error) {
-    if (error.response && error.response.status === 404) {
-      console.log(
-        `Transaction ${transaction} not found. It may have been deleted.`
-      );
-    } else {
-      console.error(
-        `Error processing transaction ${transaction}:`,
-        error.message
-      );
-    }
+    console.error("Error handling transaction:", error);
   }
 }
 

@@ -4,23 +4,69 @@ const { v4: uuidv4 } = require("uuid");
 
 const orderLocks = new Map();
 
-exports.preparePayment = (req, res) => {
+exports.preparePayment = async (req, res) => {
   try {
-    const { totalWithShipping, orderNumber } = req.body;
+    const { totalWithShipping, orderNumber, items, userId } = req.body;
+
+    // Check om der allerede eksisterer en purchase med dette ordrenummer
+    const existingPurchase = await sanityClient.fetch(
+      `*[_type == "purchase" && orderNumber == $orderNumber][0]`,
+      { orderNumber }
+    );
+
+    if (existingPurchase) {
+      return res.status(409).json({
+        message: "Order already exists",
+        onPayParams: null, // eller tidligere genererede parametre hvis relevant
+      });
+    }
+
     const currency = "DKK";
     const amount = Math.round(totalWithShipping * 100).toString();
-    const acceptUrl = `${process.env.FRONTEND_URL}/order-confirmation/${orderNumber}`;
-    const callbackUrl = `${process.env.BACKEND_URL}/api/payment-callback`;
-    const declineUrl = `${process.env.FRONTEND_URL}/payment-failed/${orderNumber}`;
 
+    // Find bruger
+    const user = await sanityClient.fetch(
+      `*[_type == "user" && auth0Id == $userId][0]._id`,
+      { userId }
+    );
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Opret purchase dokument
+    const purchase = await sanityClient.create({
+      _type: "purchase",
+      purchaseId: orderNumber,
+      orderNumber: orderNumber, // Tilføj dette felt eksplicit
+      status: "pending",
+      totalAmount: totalWithShipping,
+      currency: currency,
+      createdAt: new Date().toISOString(),
+      purchasedItems: items,
+    });
+
+    // Opdater bruger
+    await sanityClient
+      .patch(user)
+      .setIfMissing({ purchases: [] })
+      .append("purchases", [
+        {
+          _type: "reference",
+          _ref: purchase._id,
+        },
+      ])
+      .commit();
+
+    // Forbered OnPay parametre
     const params = {
       onpay_gatewayid: process.env.ONPAY_GATEWAY_ID,
       onpay_currency: currency,
       onpay_amount: amount,
       onpay_reference: orderNumber,
-      onpay_accepturl: acceptUrl,
-      onpay_callbackurl: callbackUrl,
-      onpay_declineurl: declineUrl,
+      onpay_accepturl: `${process.env.FRONTEND_URL}/order-confirmation/${orderNumber}`,
+      onpay_callbackurl: `${process.env.BACKEND_URL}/api/payment-callback`,
+      onpay_declineurl: `${process.env.FRONTEND_URL}/payment-failed/${orderNumber}`,
     };
 
     const hmacSha1 = calculateHmacSha1(params, process.env.ONPAY_SECRET);
@@ -34,6 +80,12 @@ exports.preparePayment = (req, res) => {
     res.status(500).json({ message: "Internal server error" });
   }
 };
+
+// Tilføj denne hjælpefunktion for at sikre valid Sanity ID
+function sanitizeSanityId(id) {
+  // Fjern ugyldige karakterer og erstat med understregning
+  return id.replace(/[^a-zA-Z0-9_-]/g, "_");
+}
 
 exports.verifyPayment = (req, res) => {
   try {
@@ -73,45 +125,34 @@ exports.verifyPayment = (req, res) => {
 exports.updateOrderStatus = async (req, res) => {
   const { orderNumber } = req.body;
 
-  if (orderLocks.get(orderNumber)) {
-    return res.status(409).json({ message: "Order update in progress" });
+  if (!orderNumber) {
+    return res.status(400).json({ message: "Order number is required" });
   }
-
-  orderLocks.set(orderNumber, true);
-
-  // Automatisk frigørelse af låsen efter 30 sekunder
-  setTimeout(() => {
-    orderLocks.delete(orderNumber);
-  }, 30000);
 
   try {
     const { status, onpayDetails } = req.body;
 
+    // Find eksisterende ordre
     const existingOrder = await sanityClient.fetch(
       `*[_type == "purchase" && orderNumber == $orderNumber][0]`,
       { orderNumber }
     );
 
-    let updatedOrder;
+    if (!existingOrder) {
+      return res.status(404).json({ message: "Order not found" });
+    }
 
-    if (existingOrder) {
-      updatedOrder = await sanityClient
-        .patch(existingOrder._id)
-        .set({
-          status,
-          onpayDetails,
-          totalAmount: parseInt(onpayDetails.onpay_amount) / 100,
-          currency:
-            onpayDetails.onpay_currency === "208"
-              ? "DKK"
-              : onpayDetails.onpay_currency,
-          updatedAt: new Date().toISOString(),
-        })
-        .commit();
-    } else {
-      updatedOrder = await sanityClient.create({
-        _type: "purchase",
-        orderNumber,
+    // Hvis ordren allerede har samme status, returner success uden at opdatere
+    if (existingOrder.status === status) {
+      return res.json({
+        status: existingOrder.status,
+        orderDetails: existingOrder,
+      });
+    }
+
+    const updatedOrder = await sanityClient
+      .patch(existingOrder._id)
+      .set({
         status,
         onpayDetails,
         totalAmount: parseInt(onpayDetails.onpay_amount) / 100,
@@ -119,10 +160,9 @@ exports.updateOrderStatus = async (req, res) => {
           onpayDetails.onpay_currency === "208"
             ? "DKK"
             : onpayDetails.onpay_currency,
-        createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
-      });
-    }
+      })
+      .commit();
 
     console.log("Updated order:", updatedOrder);
 
@@ -130,25 +170,54 @@ exports.updateOrderStatus = async (req, res) => {
   } catch (error) {
     console.error("Error updating order status:", error);
     res.status(500).json({ message: "Failed to update order status" });
-  } finally {
-    orderLocks.delete(orderNumber);
   }
 };
 
 exports.handlePaymentCallback = async (req, res) => {
   console.log("Received callback from OnPay:", req.body);
 
-  res.status(200).send("OK");
-
   try {
-    const result = await processCallback(req.body);
-    if (result) {
-      console.log("Callback processed successfully");
-    } else {
-      console.error("Failed to process callback");
+    const {
+      onpay_reference: purchaseId,
+      onpay_amount: amount,
+      onpay_currency: currency,
+      onpay_errorcode: errorCode,
+    } = req.body;
+
+    // Verify HMAC
+    const calculatedHmac = calculateHmacSha1(
+      req.body,
+      process.env.ONPAY_SECRET
+    );
+    if (calculatedHmac !== req.body.onpay_hmac_sha1) {
+      throw new Error("Invalid HMAC");
     }
+
+    // Find eksisterende ordre
+    const purchase = await sanityClient.fetch(
+      `*[_type == "purchase" && purchaseId == $purchaseId][0]`,
+      { purchaseId }
+    );
+
+    if (!purchase) {
+      throw new Error("Purchase not found");
+    }
+
+    // Opdater purchase status
+    await sanityClient
+      .patch(purchase._id)
+      .set({
+        status: errorCode === "0" ? "success" : "failed",
+        totalAmount: parseInt(amount) / 100,
+        currency: currency === "208" ? "DKK" : currency,
+        updatedAt: new Date().toISOString(),
+      })
+      .commit();
+
+    res.status(200).send("OK");
   } catch (error) {
     console.error("Error processing callback:", error);
+    res.status(500).send("Error");
   }
 };
 
@@ -157,17 +226,31 @@ exports.createTempOrder = async (req, res) => {
     const { cartItems, shippingInfo, totalAmount } = req.body;
     const orderNumber = `ORDER-${Date.now()}`;
 
-    const tempOrder = await sanityClient.create({
-      _type: "tempOrder",
-      orderNumber: orderNumber,
-      cartItems: cartItems,
-      shippingInfo: shippingInfo,
-      totalAmount: totalAmount,
+    // Check om ordren allerede eksisterer
+    const existingOrder = await sanityClient.fetch(
+      `*[_type == "purchase" && orderNumber == $orderNumber][0]`,
+      { orderNumber }
+    );
+
+    if (existingOrder) {
+      return res.status(409).json({ message: "Order already exists" });
+    }
+
+    const tempOrder = {
+      orderNumber,
+      cartItems,
+      shippingInfo,
+      totalAmount,
       status: "pending",
       createdAt: new Date().toISOString(),
+    };
+
+    await sanityClient.create({
+      _type: "tempOrder",
+      ...tempOrder,
     });
 
-    res.json({ orderNumber: tempOrder.orderNumber });
+    res.json({ orderNumber: orderNumber });
   } catch (error) {
     console.error("Error creating temporary order:", error);
     res.status(500).json({ message: "Failed to create temporary order" });
