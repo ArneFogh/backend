@@ -2,63 +2,56 @@ const { sanityClient } = require("../sanityClient");
 const { calculateHmacSha1, sendAlertToTeam } = require("../utils/paymentUtils");
 const { v4: uuidv4 } = require("uuid");
 
+const pendingOrders = new Map();
 const orderLocks = new Map();
 
 exports.preparePayment = async (req, res) => {
-  try {
-    const { totalWithShipping, orderNumber, items, userId } = req.body;
+  const { orderNumber, totalWithShipping, items, userId, shippingInfo } =
+    req.body;
 
-    // Check om der allerede eksisterer en purchase med dette ordrenummer
-    const existingPurchase = await sanityClient.fetch(
+  if (!orderNumber || !totalWithShipping || !items || !userId) {
+    return res.status(400).json({
+      message: "Missing required fields",
+      details: "orderNumber, totalWithShipping, items, and userId are required",
+    });
+  }
+
+  // Implementer mutex/locking mekanisme
+  if (orderLocks.has(orderNumber)) {
+    return res.status(409).json({
+      message: "Order is being processed",
+      status: "locked",
+    });
+  }
+
+  orderLocks.set(orderNumber, true);
+
+  try {
+    // Check for existing order i Sanity
+    const existingOrder = await sanityClient.fetch(
       `*[_type == "purchase" && orderNumber == $orderNumber][0]`,
       { orderNumber }
     );
 
-    if (existingPurchase) {
+    if (existingOrder) {
       return res.status(409).json({
         message: "Order already exists",
-        onPayParams: null, // eller tidligere genererede parametre hvis relevant
+        onPayParams: null,
       });
     }
 
+    // Check for existing pending order
+    if (pendingOrders.has(orderNumber)) {
+      return res.status(409).json({
+        message: "Order is already pending",
+        onPayParams: null,
+      });
+    }
+
+    // Prepare OnPay parameters
     const currency = "DKK";
     const amount = Math.round(totalWithShipping * 100).toString();
 
-    // Find bruger
-    const user = await sanityClient.fetch(
-      `*[_type == "user" && auth0Id == $userId][0]._id`,
-      { userId }
-    );
-
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
-
-    // Opret purchase dokument
-    const purchase = await sanityClient.create({
-      _type: "purchase",
-      purchaseId: orderNumber,
-      orderNumber: orderNumber, // Tilføj dette felt eksplicit
-      status: "pending",
-      totalAmount: totalWithShipping,
-      currency: currency,
-      createdAt: new Date().toISOString(),
-      purchasedItems: items,
-    });
-
-    // Opdater bruger
-    await sanityClient
-      .patch(user)
-      .setIfMissing({ purchases: [] })
-      .append("purchases", [
-        {
-          _type: "reference",
-          _ref: purchase._id,
-        },
-      ])
-      .commit();
-
-    // Forbered OnPay parametre
     const params = {
       onpay_gatewayid: process.env.ONPAY_GATEWAY_ID,
       onpay_currency: currency,
@@ -71,13 +64,40 @@ exports.preparePayment = async (req, res) => {
 
     const hmacSha1 = calculateHmacSha1(params, process.env.ONPAY_SECRET);
 
+    // Store pending order data
+    const purchase = {
+      _type: "purchase",
+      orderNumber,
+      status: "pending",
+      totalAmount: totalWithShipping,
+      currency: "DKK",
+      createdAt: new Date().toISOString(),
+      purchasedItems: items,
+      shippingInfo,
+    };
+
+    // Store i pending orders
+    pendingOrders.set(orderNumber, purchase);
+
+    // Setup cleanup after 30 minutes
+    setTimeout(() => {
+      pendingOrders.delete(orderNumber);
+    }, 30 * 60 * 1000);
+
+    console.log(`Stored pending order: ${orderNumber}`);
+
     res.json({
       ...params,
       onpay_hmac_sha1: hmacSha1,
     });
   } catch (error) {
     console.error("Error in preparePayment:", error);
-    res.status(500).json({ message: "Internal server error" });
+    res.status(500).json({
+      message: "Internal server error",
+      error: error.message,
+    });
+  } finally {
+    orderLocks.delete(orderNumber);
   }
 };
 
@@ -123,33 +143,51 @@ exports.verifyPayment = (req, res) => {
 };
 
 exports.updateOrderStatus = async (req, res) => {
-  const { orderNumber } = req.body;
+  const { orderNumber, status, onpayDetails } = req.body;
+  console.log("Updating order status:", { orderNumber, status, onpayDetails });
 
   if (!orderNumber) {
     return res.status(400).json({ message: "Order number is required" });
   }
 
   try {
-    const { status, onpayDetails } = req.body;
+    // Check pending orders først
+    const pendingOrder = pendingOrders.get(orderNumber);
 
-    // Find eksisterende ordre
+    if (pendingOrder) {
+      // Opret ordren i Sanity hvis den var pending
+      const newOrder = await sanityClient.create({
+        ...pendingOrder,
+        status: status,
+        onpayDetails,
+        updatedAt: new Date().toISOString(),
+      });
+
+      // Fjern fra pending orders
+      pendingOrders.delete(orderNumber);
+
+      console.log("Created new order from pending:", newOrder);
+      return res.json({
+        status: newOrder.status,
+        orderDetails: newOrder,
+      });
+    }
+
+    // Hvis ikke i pending orders, check Sanity
     const existingOrder = await sanityClient.fetch(
       `*[_type == "purchase" && orderNumber == $orderNumber][0]`,
       { orderNumber }
     );
 
     if (!existingOrder) {
-      return res.status(404).json({ message: "Order not found" });
-    }
-
-    // Hvis ordren allerede har samme status, returner success uden at opdatere
-    if (existingOrder.status === status) {
-      return res.json({
-        status: existingOrder.status,
-        orderDetails: existingOrder,
+      console.log(`No order found with number: ${orderNumber}`);
+      return res.status(404).json({
+        message: "Order not found",
+        details: `No order found with number: ${orderNumber}`,
       });
     }
 
+    // Opdater eksisterende ordre
     const updatedOrder = await sanityClient
       .patch(existingOrder._id)
       .set({
@@ -164,12 +202,18 @@ exports.updateOrderStatus = async (req, res) => {
       })
       .commit();
 
-    console.log("Updated order:", updatedOrder);
+    console.log("Updated existing order:", updatedOrder);
 
-    res.json({ status: updatedOrder.status, orderDetails: updatedOrder });
+    res.json({
+      status: updatedOrder.status,
+      orderDetails: updatedOrder,
+    });
   } catch (error) {
     console.error("Error updating order status:", error);
-    res.status(500).json({ message: "Failed to update order status" });
+    res.status(500).json({
+      message: "Failed to update order status",
+      error: error.message,
+    });
   }
 };
 
@@ -178,7 +222,7 @@ exports.handlePaymentCallback = async (req, res) => {
 
   try {
     const {
-      onpay_reference: purchaseId,
+      onpay_reference: orderNumber,
       onpay_amount: amount,
       onpay_currency: currency,
       onpay_errorcode: errorCode,
@@ -193,67 +237,30 @@ exports.handlePaymentCallback = async (req, res) => {
       throw new Error("Invalid HMAC");
     }
 
-    // Find eksisterende ordre
-    const purchase = await sanityClient.fetch(
-      `*[_type == "purchase" && purchaseId == $purchaseId][0]`,
-      { purchaseId }
-    );
+    // Check pending orders først
+    const pendingOrder = pendingOrders.get(orderNumber);
 
-    if (!purchase) {
-      throw new Error("Purchase not found");
-    }
-
-    // Opdater purchase status
-    await sanityClient
-      .patch(purchase._id)
-      .set({
+    if (pendingOrder) {
+      // Opret ordren i Sanity
+      const purchase = await sanityClient.create({
+        ...pendingOrder,
         status: errorCode === "0" ? "success" : "failed",
         totalAmount: parseInt(amount) / 100,
         currency: currency === "208" ? "DKK" : currency,
         updatedAt: new Date().toISOString(),
-      })
-      .commit();
+        onpayDetails: req.body,
+      });
+
+      // Fjern fra pending orders
+      pendingOrders.delete(orderNumber);
+
+      console.log(`Created purchase in Sanity: ${purchase._id}`);
+    }
 
     res.status(200).send("OK");
   } catch (error) {
     console.error("Error processing callback:", error);
     res.status(500).send("Error");
-  }
-};
-
-exports.createTempOrder = async (req, res) => {
-  try {
-    const { cartItems, shippingInfo, totalAmount } = req.body;
-    const orderNumber = `ORDER-${Date.now()}`;
-
-    // Check om ordren allerede eksisterer
-    const existingOrder = await sanityClient.fetch(
-      `*[_type == "purchase" && orderNumber == $orderNumber][0]`,
-      { orderNumber }
-    );
-
-    if (existingOrder) {
-      return res.status(409).json({ message: "Order already exists" });
-    }
-
-    const tempOrder = {
-      orderNumber,
-      cartItems,
-      shippingInfo,
-      totalAmount,
-      status: "pending",
-      createdAt: new Date().toISOString(),
-    };
-
-    await sanityClient.create({
-      _type: "tempOrder",
-      ...tempOrder,
-    });
-
-    res.json({ orderNumber: orderNumber });
-  } catch (error) {
-    console.error("Error creating temporary order:", error);
-    res.status(500).json({ message: "Failed to create temporary order" });
   }
 };
 
