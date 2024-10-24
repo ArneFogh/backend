@@ -167,9 +167,28 @@ exports.updateOrderStatus = async (req, res) => {
     const formattedOnpayDetails = formatOnpayDetails(onpayDetails);
 
     if (order._type === "tempOrder") {
+      // Hent bruger ID fra tempOrder
+      const userId = order.userId;
+
+      // Hent bruger dokument fra Sanity
+      const user = await sanityClient.fetch(
+        `*[_type == "user" && auth0Id == $userId][0]`,
+        { userId }
+      );
+
+      if (!user) {
+        console.log(`No user found for ID: ${userId}`);
+        return res.status(404).json({ message: "User not found" });
+      }
+
+      // Generer purchaseId
+      const purchaseId = `P${Date.now()}`;
+
       const purchase = {
         _type: "purchase",
-        orderNumber,
+        purchaseId: purchaseId, // Auto-genereret sekventielt ordre ID
+        orderNumber: orderNumber,
+        onpayTransactionId: onpayDetails.onpay_uuid, // Unikt transaktions ID fra OnPay
         status: mappedStatus,
         totalAmount: parseInt(onpayDetails.onpay_amount) / 100,
         currency:
@@ -184,16 +203,34 @@ exports.updateOrderStatus = async (req, res) => {
         updatedAt: new Date().toISOString(),
       };
 
-      const transaction = sanityClient.transaction();
-      transaction.create(purchase);
-      transaction.delete(order._id);
-      await transaction.commit();
+      // Opret purchase dokument
+      const createdPurchase = await sanityClient.create(purchase);
 
-      console.log("Created purchase from tempOrder:", purchase);
+      console.log("Created purchase document:", createdPurchase);
+
+      // Opdater user med reference til det nye purchase dokument
+      await sanityClient
+        .patch(user._id)
+        .setIfMissing({ purchases: [] })
+        .append("purchases", [
+          {
+            _key: purchaseId, // Brug purchaseId som _key
+            _type: "reference",
+            _ref: createdPurchase._id, // createdPurchase._id indeholder nu det korrekte Sanity dokument ID
+          },
+        ])
+        .commit();
+
+      console.log(
+        `Updated user ${user._id} with purchase reference to ${createdPurchase._id}`
+      );
+
+      // Slet temp order
+      await sanityClient.delete(order._id);
 
       return res.json({
-        status: purchase.status,
-        orderDetails: purchase,
+        status: mappedStatus,
+        orderDetails: createdPurchase,
       });
     } else {
       const updatedOrder = await sanityClient
@@ -235,13 +272,90 @@ exports.handlePaymentCallback = async (req, res) => {
       throw new Error("Invalid HMAC");
     }
 
-    await processCallback(req.body);
-    res.status(200).send("OK");
+    const success = await processPaymentCallback(req.body);
+    if (success) {
+      res.status(200).send("OK");
+    } else {
+      res.status(500).send("Processing failed");
+    }
   } catch (error) {
     console.error("Error processing callback:", error);
     res.status(500).send("Error");
   }
 };
+
+async function processPaymentCallback(data) {
+  const { onpay_reference: orderNumber } = data;
+
+  try {
+    // Find temp order
+    const tempOrder = await sanityClient.fetch(
+      `*[_type == "tempOrder" && orderNumber == $orderNumber][0]`,
+      { orderNumber }
+    );
+
+    if (!tempOrder) {
+      console.log(`No temp order found for ${orderNumber}`);
+      return false;
+    }
+
+    // Find user
+    const user = await sanityClient.fetch(
+      `*[_type == "user" && auth0Id == $userId][0]`,
+      { userId: tempOrder.userId }
+    );
+
+    if (!user) {
+      console.log(`No user found for ID: ${tempOrder.userId}`);
+      return false;
+    }
+
+    const purchase = {
+      _type: "purchase",
+      orderNumber,
+      status: data.onpay_errorcode === "0" ? "authorized" : "failed",
+      totalAmount: parseInt(data.onpay_amount) / 100,
+      currency: data.onpay_currency === "208" ? "DKK" : data.onpay_currency,
+      purchasedItems: tempOrder.items,
+      shippingInfo: tempOrder.shippingInfo,
+      billingInfo: tempOrder.billingInfo,
+      onpayDetails: {
+        uuid: data.onpay_uuid,
+        method: data.onpay_method || data.onpay_wallet || "card",
+      },
+      createdAt: tempOrder.createdAt,
+      updatedAt: new Date().toISOString(),
+    };
+
+    // Brug transaction til at sikre atomisk operation
+    const transaction = sanityClient.transaction();
+
+    // Opret purchase
+    const createdPurchase = await transaction.create(purchase).commit();
+
+    // Opdater user med reference til purchase
+    await sanityClient
+      .patch(user._id)
+      .setIfMissing({ purchases: [] })
+      .append("purchases", [
+        {
+          _type: "reference",
+          _ref: createdPurchase._id,
+          _key: `purchase-${Date.now()}`,
+        },
+      ])
+      .commit();
+
+    // Slet temp order
+    await sanityClient.delete(tempOrder._id);
+
+    console.log(`Successfully processed payment for order ${orderNumber}`);
+    return true;
+  } catch (error) {
+    console.error(`Error processing payment for ${orderNumber}:`, error);
+    return false;
+  }
+}
 
 exports.getOrderStatus = async (req, res) => {
   try {

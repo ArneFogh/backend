@@ -88,6 +88,103 @@ async function processPayment(paymentData, retry = 0) {
   }
 }
 
+async function processCallback(data) {
+  console.log("Processing callback data:", data);
+
+  const { onpay_reference } = data;
+
+  if (orderLocks.get(onpay_reference)) {
+    console.log(
+      `Order ${onpay_reference} is already being processed. Skipping.`
+    );
+    return false;
+  }
+
+  orderLocks.set(onpay_reference, true);
+
+  try {
+    const calculatedHmac = calculateHmacSha1(data, process.env.ONPAY_SECRET);
+    if (calculatedHmac !== data.onpay_hmac_sha1) {
+      console.error("HMAC verification failed");
+      throw new Error("HMAC verification failed");
+    }
+
+    const mappedStatus = mapPaymentStatus(null, data.onpay_errorcode);
+    const amount = parseInt(data.onpay_amount) / 100;
+    const formattedOnpayDetails = formatOnpayDetails(data);
+
+    // Først, tjek efter temp order
+    const tempOrder = await sanityClient.fetch(
+      `*[_type == "tempOrder" && orderNumber == $orderNumber][0]`,
+      { orderNumber: onpay_reference }
+    );
+
+    if (tempOrder) {
+      // Hent bruger
+      const user = await sanityClient.fetch(
+        `*[_type == "user" && auth0Id == $userId][0]`,
+        { userId: tempOrder.userId }
+      );
+
+      const purchase = {
+        _type: "purchase",
+        orderNumber: onpay_reference,
+        status: mappedStatus,
+        totalAmount: amount,
+        currency: data.onpay_currency === "208" ? "DKK" : data.onpay_currency,
+        purchasedItems: tempOrder.items,
+        shippingInfo: tempOrder.shippingInfo,
+        billingInfo: tempOrder.billingInfo,
+        onpayDetails: formattedOnpayDetails,
+        createdAt: tempOrder.createdAt,
+        updatedAt: new Date().toISOString(),
+      };
+
+      // Opret purchase og tilføj reference til user i én transaktion
+      const createdPurchase = await sanityClient.create(purchase);
+
+      if (user) {
+        await sanityClient
+          .patch(user._id)
+          .setIfMissing({ purchases: [] })
+          .append("purchases", [
+            { _type: "reference", _ref: createdPurchase._id },
+          ])
+          .commit();
+      }
+
+      // Slet temp order
+      await sanityClient.delete(tempOrder._id);
+    } else {
+      // Tjek efter eksisterende purchase
+      const existingPurchase = await sanityClient.fetch(
+        `*[_type == "purchase" && orderNumber == $orderNumber][0]`,
+        { orderNumber: onpay_reference }
+      );
+
+      if (existingPurchase) {
+        await sanityClient
+          .patch(existingPurchase._id)
+          .set({
+            status: mappedStatus,
+            onpayDetails: formattedOnpayDetails,
+            updatedAt: new Date().toISOString(),
+          })
+          .commit();
+      }
+    }
+
+    console.log(`Order processed successfully: ${onpay_reference}`);
+    return true;
+  } catch (error) {
+    console.error("Error processing callback:", error);
+    sendAlertToTeam("Failed to process payment callback", { data, error });
+    return false;
+  } finally {
+    orderLocks.delete(onpay_reference);
+  }
+}
+
 async function pollTransactionEvents() {
   try {
     const params = cursor ? { cursor } : {};
@@ -280,9 +377,24 @@ async function checkPendingOrders() {
             transaction
           );
 
+          // Find user
+          const user = await sanityClient.fetch(
+            `*[_type == "user" && auth0Id == $userId][0]`,
+            { userId: order.userId }
+          );
+
+          if (!user) {
+            console.log(`No user found for ID: ${order.userId}`);
+            continue;
+          }
+
+          // Generer purchaseId
+          const purchaseId = `P${Date.now()}`;
+
           // Create permanent order with updated schema
           const purchase = {
             _type: "purchase",
+            purchaseId: purchaseId,
             orderNumber: order.orderNumber,
             status: "authorized",
             totalAmount: parseInt(transaction.amount) / 100,
@@ -301,12 +413,31 @@ async function checkPendingOrders() {
             updatedAt: new Date().toISOString(),
           };
 
-          // Atomic operation
-          await sanityClient
-            .transaction()
-            .create(purchase)
-            .delete(order._id)
-            .commit();
+          // Opret purchase document
+          const createdPurchase = await sanityClient.create(purchase);
+          console.log("Created purchase document:", createdPurchase);
+
+          // Opdater user med reference til purchase
+          if (user) {
+            await sanityClient
+              .patch(user._id)
+              .setIfMissing({ purchases: [] })
+              .append("purchases", [
+                {
+                  _key: purchaseId,
+                  _type: "reference",
+                  _ref: createdPurchase._id,
+                },
+              ])
+              .commit();
+
+            console.log(
+              `Updated user ${user._id} with purchase reference to ${createdPurchase._id}`
+            );
+          }
+
+          // Slet temp order
+          await sanityClient.delete(order._id);
 
           console.log(`Created purchase order: ${order.orderNumber}`);
         } else {
@@ -322,7 +453,7 @@ async function checkPendingOrders() {
       }
     }
 
-    // Cleanup
+    // Cleanup expired orders
     const expired = await sanityClient.fetch(
       `*[_type == "tempOrder" && dateTime(expiresAt) <= dateTime(now())]`
     );
@@ -348,4 +479,4 @@ function startPolling() {
   checkPendingOrders();
 }
 
-module.exports = { startPolling, processPayment };
+module.exports = { startPolling, processPayment, checkPendingOrders };
