@@ -1,6 +1,7 @@
 const { sanityClient } = require("../sanityClient");
 const { calculateHmacSha1, sendAlertToTeam } = require("../utils/paymentUtils");
 const ORDER_EXPIRY_TIME = 30 * 60 * 1000; // 30 minutes
+const { v4: uuidv4 } = require("uuid");
 
 const pendingOrders = new Map();
 const orderLocks = new Map();
@@ -10,7 +11,6 @@ exports.preparePayment = async (req, res) => {
     req.body;
 
   try {
-    // Sikr at orderNumber er i uppercase
     const formattedOrderNumber = orderNumber.toUpperCase();
 
     const params = {
@@ -27,17 +27,30 @@ exports.preparePayment = async (req, res) => {
     console.log("HMAC params:", params);
     console.log("Generated HMAC:", hmacSha1);
 
-    // Opret tempOrder med uppercase orderNumber
+    // Opret tempOrder med alle påkrævede felter
     const tempOrder = {
       _type: "tempOrder",
       orderNumber: formattedOrderNumber,
       status: "pending",
-      items,
+      items: items.map((item) => ({
+        _key: item._key || uuidv4(), // Brug eksisterende _key eller generer ny
+        productId: item.productId,
+        productName: item.productName,
+        quantity: item.quantity,
+        price: item.price,
+      })),
       totalAmount: totalWithShipping,
       userId,
-      shippingInfo,
+      shippingInfo: {
+        fullName: shippingInfo.fullName,
+        address: shippingInfo.address,
+        city: shippingInfo.city,
+        postalCode: shippingInfo.postalCode,
+        email: shippingInfo.email,
+        country: shippingInfo.country,
+      },
       createdAt: new Date().toISOString(),
-      expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+      expiresAt: new Date(Date.now() + ORDER_EXPIRY_TIME).toISOString(),
     };
 
     await sanityClient.create(tempOrder);
