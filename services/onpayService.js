@@ -34,11 +34,11 @@ async function processPayment(paymentData, retry = 0) {
       return;
     }
 
-    // Create permanent order
+    // Create permanent order with updated schema
     const purchase = {
       _type: "purchase",
       orderNumber,
-      status: paymentData.onpay_errorcode === "0" ? "success" : "failed",
+      status: paymentData.onpay_errorcode === "0" ? "authorized" : "failed",
       totalAmount: parseInt(paymentData.onpay_amount) / 100,
       currency:
         paymentData.onpay_currency === "208"
@@ -46,11 +46,15 @@ async function processPayment(paymentData, retry = 0) {
           : paymentData.onpay_currency,
       purchasedItems: tempOrder.items,
       shippingInfo: tempOrder.shippingInfo,
-      userId: tempOrder.userId,
+      billingInfo: tempOrder.sameAsShipping
+        ? tempOrder.shippingInfo
+        : tempOrder.billingInfo,
       createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      onpayTransactionId: transactionId,
       onpayDetails: {
-        transactionId,
-        ...paymentData,
+        uuid: transactionId,
+        method: paymentData.onpay_method || paymentData.onpay_wallet || "card",
       },
     };
 
@@ -163,7 +167,8 @@ async function handleTransactionEvent(event) {
 
 async function updateOrCreateOrder(transactionData) {
   const orderNumber = transactionData.order_id;
-  const status = transactionData.status === "captured" ? "Success" : "Pending";
+  const status =
+    transactionData.status === "captured" ? "captured" : "authorized";
 
   try {
     let order = await sanityClient.fetch(
@@ -173,26 +178,42 @@ async function updateOrCreateOrder(transactionData) {
 
     const now = new Date().toISOString();
     const onpayDetails = {
-      transactionId: transactionData.uuid,
-      amount: transactionData.amount,
-      currency: transactionData.currency,
-      status: transactionData.status,
+      uuid: transactionData.uuid,
+      method: transactionData.wallet || "card",
     };
 
     if (!order) {
+      // Get temp order for shipping and billing info
+      const tempOrder = await sanityClient.fetch(
+        `*[_type == "tempOrder" && orderNumber == $orderNumber][0]`
+      );
+
+      if (!tempOrder) {
+        console.error(`No temp order found for ${orderNumber}`);
+        return;
+      }
+
       order = await sanityClient.create({
         _type: "purchase",
         orderNumber: orderNumber,
         status: status,
+        totalAmount: parseInt(transactionData.amount) / 100,
+        currency:
+          transactionData.currency_code === "208"
+            ? "DKK"
+            : transactionData.currency_code,
+        purchasedItems: tempOrder.items,
+        shippingInfo: tempOrder.shippingInfo,
+        billingInfo: tempOrder.sameAsShipping
+          ? tempOrder.shippingInfo
+          : tempOrder.billingInfo,
+        onpayTransactionId: transactionData.uuid,
         onpayDetails,
         createdAt: now,
         updatedAt: now,
       });
       console.log(`Created new order ${orderNumber} with status: ${status}`);
-    } else if (
-      order.status !== status ||
-      order.onpayDetails.status !== transactionData.status
-    ) {
+    } else if (order.status !== status) {
       await sanityClient
         .patch(order._id)
         .set({
@@ -236,7 +257,6 @@ async function checkPendingOrders() {
           }
         );
 
-        // Find matching transaktion
         const transaction = transactionsResponse.data.data.find((tx) => {
           const isMatch =
             tx.order_id === order.orderNumber &&
@@ -260,7 +280,7 @@ async function checkPendingOrders() {
             transaction
           );
 
-          // Opret permanent order
+          // Create permanent order with updated schema
           const purchase = {
             _type: "purchase",
             orderNumber: order.orderNumber,
@@ -269,19 +289,19 @@ async function checkPendingOrders() {
             currency: "DKK",
             purchasedItems: order.items,
             shippingInfo: order.shippingInfo,
+            billingInfo: order.sameAsShipping
+              ? order.shippingInfo
+              : order.billingInfo,
             onpayTransactionId: transaction.uuid,
             onpayDetails: {
               uuid: transaction.uuid,
-              amount: transaction.amount,
-              currency: transaction.currency_code,
               method: transaction.wallet || "card",
-              status: transaction.status,
             },
             createdAt: order.createdAt,
             updatedAt: new Date().toISOString(),
           };
 
-          // Atomisk operation
+          // Atomic operation
           await sanityClient
             .transaction()
             .create(purchase)
