@@ -18,6 +18,13 @@ function mapPaymentStatus(status, errorCode) {
   }
 }
 
+function formatOnpayDetails(rawDetails) {
+  return {
+    uuid: rawDetails.onpay_uuid,
+    method: rawDetails.onpay_method || rawDetails.onpay_wallet || "card", // Fallback til 'card' hvis ingen metode er specificeret
+  };
+}
+
 exports.preparePayment = async (req, res) => {
   const {
     orderNumber,
@@ -140,7 +147,6 @@ exports.updateOrderStatus = async (req, res) => {
   console.log("Updating order status:", { orderNumber, status, onpayDetails });
 
   try {
-    // Check både tempOrder og purchase collections
     const order = await sanityClient.fetch(
       `*[(_type == "tempOrder" || _type == "purchase") && orderNumber == $orderNumber][0]`,
       { orderNumber }
@@ -154,14 +160,13 @@ exports.updateOrderStatus = async (req, res) => {
       });
     }
 
-    // Konverter status til det korrekte format
     const mappedStatus = mapPaymentStatus(
       status,
       onpayDetails?.onpay_errorcode
     );
+    const formattedOnpayDetails = formatOnpayDetails(onpayDetails);
 
     if (order._type === "tempOrder") {
-      // Konverter tempOrder til permanent order
       const purchase = {
         _type: "purchase",
         orderNumber,
@@ -173,13 +178,12 @@ exports.updateOrderStatus = async (req, res) => {
             : onpayDetails.onpay_currency,
         purchasedItems: order.items,
         shippingInfo: order.shippingInfo,
-        billingInfo: order.billingInfo, // Tilføjet billing info
-        onpayDetails,
+        billingInfo: order.billingInfo,
+        onpayDetails: formattedOnpayDetails,
         createdAt: order.createdAt,
         updatedAt: new Date().toISOString(),
       };
 
-      // Brug transaction til at sikre atomisk operation
       const transaction = sanityClient.transaction();
       transaction.create(purchase);
       transaction.delete(order._id);
@@ -192,12 +196,11 @@ exports.updateOrderStatus = async (req, res) => {
         orderDetails: purchase,
       });
     } else {
-      // Opdater eksisterende order
       const updatedOrder = await sanityClient
         .patch(order._id)
         .set({
           status: mappedStatus,
-          onpayDetails,
+          onpayDetails: formattedOnpayDetails,
           updatedAt: new Date().toISOString(),
         })
         .commit();
@@ -224,7 +227,6 @@ exports.handlePaymentCallback = async (req, res) => {
   try {
     const { onpay_reference: orderNumber } = req.body;
 
-    // Verify HMAC
     const calculatedHmac = calculateHmacSha1(
       req.body,
       process.env.ONPAY_SECRET
@@ -283,23 +285,15 @@ async function processCallback(data) {
   orderLocks.set(onpay_reference, true);
 
   try {
-    const {
-      onpay_uuid,
-      onpay_number,
-      onpay_amount,
-      onpay_currency,
-      onpay_errorcode,
-      onpay_hmac_sha1,
-    } = data;
-
     const calculatedHmac = calculateHmacSha1(data, process.env.ONPAY_SECRET);
-    if (calculatedHmac !== onpay_hmac_sha1) {
+    if (calculatedHmac !== data.onpay_hmac_sha1) {
       console.error("HMAC verification failed");
       throw new Error("HMAC verification failed");
     }
 
-    const mappedStatus = mapPaymentStatus(null, onpay_errorcode);
-    const amount = parseInt(onpay_amount) / 100;
+    const mappedStatus = mapPaymentStatus(null, data.onpay_errorcode);
+    const amount = parseInt(data.onpay_amount) / 100;
+    const formattedOnpayDetails = formatOnpayDetails(data);
 
     const order = await sanityClient.fetch(
       `*[_type == "purchase" && orderNumber == $orderNumber][0]`,
@@ -313,12 +307,8 @@ async function processCallback(data) {
         .set({
           status: mappedStatus,
           totalAmount: amount,
-          currency: onpay_currency === "208" ? "DKK" : onpay_currency,
-          onpayDetails: {
-            uuid: onpay_uuid,
-            number: onpay_number,
-            errorCode: onpay_errorcode,
-          },
+          currency: data.onpay_currency === "208" ? "DKK" : data.onpay_currency,
+          onpayDetails: formattedOnpayDetails,
           updatedAt: new Date().toISOString(),
         })
         .commit();
@@ -329,12 +319,8 @@ async function processCallback(data) {
         orderNumber: onpay_reference,
         status: mappedStatus,
         totalAmount: amount,
-        currency: onpay_currency === "208" ? "DKK" : onpay_currency,
-        onpayDetails: {
-          uuid: onpay_uuid,
-          number: onpay_number,
-          errorCode: onpay_errorcode,
-        },
+        currency: data.onpay_currency === "208" ? "DKK" : data.onpay_currency,
+        onpayDetails: formattedOnpayDetails,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       });
