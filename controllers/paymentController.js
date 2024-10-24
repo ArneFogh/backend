@@ -6,6 +6,18 @@ const { v4: uuidv4 } = require("uuid");
 const pendingOrders = new Map();
 const orderLocks = new Map();
 
+function mapPaymentStatus(status, errorCode) {
+  if (errorCode === "0" || status === "Success") {
+    return "authorized";
+  } else if (status === "captured") {
+    return "captured";
+  } else if (status === "declined") {
+    return "cancelled";
+  } else {
+    return "failed";
+  }
+}
+
 exports.preparePayment = async (req, res) => {
   const {
     orderNumber,
@@ -142,12 +154,18 @@ exports.updateOrderStatus = async (req, res) => {
       });
     }
 
+    // Konverter status til det korrekte format
+    const mappedStatus = mapPaymentStatus(
+      status,
+      onpayDetails?.onpay_errorcode
+    );
+
     if (order._type === "tempOrder") {
       // Konverter tempOrder til permanent order
       const purchase = {
         _type: "purchase",
         orderNumber,
-        status: status,
+        status: mappedStatus,
         totalAmount: parseInt(onpayDetails.onpay_amount) / 100,
         currency:
           onpayDetails.onpay_currency === "208"
@@ -155,6 +173,7 @@ exports.updateOrderStatus = async (req, res) => {
             : onpayDetails.onpay_currency,
         purchasedItems: order.items,
         shippingInfo: order.shippingInfo,
+        billingInfo: order.billingInfo, // Tilføjet billing info
         onpayDetails,
         createdAt: order.createdAt,
         updatedAt: new Date().toISOString(),
@@ -177,7 +196,7 @@ exports.updateOrderStatus = async (req, res) => {
       const updatedOrder = await sanityClient
         .patch(order._id)
         .set({
-          status,
+          status: mappedStatus,
           onpayDetails,
           updatedAt: new Date().toISOString(),
         })
@@ -214,7 +233,7 @@ exports.handlePaymentCallback = async (req, res) => {
       throw new Error("Invalid HMAC");
     }
 
-    await processPayment(req.body);
+    await processCallback(req.body);
     res.status(200).send("OK");
   } catch (error) {
     console.error("Error processing callback:", error);
@@ -279,7 +298,7 @@ async function processCallback(data) {
       throw new Error("HMAC verification failed");
     }
 
-    const status = onpay_errorcode === "0" ? "Success" : "Failed";
+    const mappedStatus = mapPaymentStatus(null, onpay_errorcode);
     const amount = parseInt(onpay_amount) / 100;
 
     const order = await sanityClient.fetch(
@@ -292,7 +311,7 @@ async function processCallback(data) {
       await sanityClient
         .patch(order._id)
         .set({
-          status: status,
+          status: mappedStatus,
           totalAmount: amount,
           currency: onpay_currency === "208" ? "DKK" : onpay_currency,
           onpayDetails: {
@@ -308,7 +327,7 @@ async function processCallback(data) {
       await sanityClient.create({
         _type: "purchase",
         orderNumber: onpay_reference,
-        status: status,
+        status: mappedStatus,
         totalAmount: amount,
         currency: onpay_currency === "208" ? "DKK" : onpay_currency,
         onpayDetails: {
