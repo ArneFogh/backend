@@ -2,10 +2,87 @@ const axios = require("axios");
 const { sanityClient } = require("../sanityClient");
 
 let cursor = null;
-const POLLING_INTERVAL = process.env.ONPAY_POLLING_INTERVAL || 10000; // Ændret til 10 sekunder for hurtigere test
-const PENDING_CHECK_INTERVAL = 5 * 60 * 1000; // Ændret til 5 minutter for hurtigere test
-const EVENT_AGE_LIMIT = 7 * 24 * 60 * 60 * 1000; // 7 dage i millisekunder
+const POLLING_INTERVAL = 60000; // 1 minute
+const PENDING_CHECK_INTERVAL = 60000; //5 * 60 * 1000; // 5 minutes
+const MAX_RETRIES = 3;
 const processedTransactions = new Set();
+
+async function processPayment(paymentData, retry = 0) {
+  const { onpay_reference: orderNumber, onpay_uuid: transactionId } =
+    paymentData;
+
+  try {
+    // Check if order already exists in Sanity
+    const existingOrder = await sanityClient.fetch(
+      `*[_type == "purchase" && orderNumber == $orderNumber][0]`,
+      { orderNumber }
+    );
+
+    if (existingOrder) {
+      console.log(`Order ${orderNumber} already exists, skipping processing`);
+      return;
+    }
+
+    // Get temp order
+    const tempOrder = await sanityClient.fetch(
+      `*[_type == "tempOrder" && orderNumber == $orderNumber][0]`,
+      { orderNumber }
+    );
+
+    if (!tempOrder) {
+      console.error(`No temp order found for ${orderNumber}`);
+      return;
+    }
+
+    // Create permanent order
+    const purchase = {
+      _type: "purchase",
+      orderNumber,
+      status: paymentData.onpay_errorcode === "0" ? "success" : "failed",
+      totalAmount: parseInt(paymentData.onpay_amount) / 100,
+      currency:
+        paymentData.onpay_currency === "208"
+          ? "DKK"
+          : paymentData.onpay_currency,
+      purchasedItems: tempOrder.items,
+      shippingInfo: tempOrder.shippingInfo,
+      userId: tempOrder.userId,
+      createdAt: new Date().toISOString(),
+      onpayDetails: {
+        transactionId,
+        ...paymentData,
+      },
+    };
+
+    // Use a transaction to ensure atomicity
+    await sanityClient
+      .transaction()
+      .create(purchase)
+      .delete(tempOrder._id)
+      .commit();
+
+    console.log(`Successfully processed order ${orderNumber}`);
+  } catch (error) {
+    console.error(`Error processing payment for order ${orderNumber}:`, error);
+
+    if (retry < MAX_RETRIES) {
+      console.log(
+        `Retrying payment processing for order ${orderNumber} (attempt ${
+          retry + 1
+        })`
+      );
+      setTimeout(
+        () => processPayment(paymentData, retry + 1),
+        5000 * (retry + 1)
+      );
+    } else {
+      sendAlertToTeam("Failed to process payment after max retries", {
+        orderNumber,
+        error: error.message,
+      });
+    }
+  }
+}
 
 async function pollTransactionEvents() {
   try {
@@ -137,16 +214,21 @@ async function updateOrCreateOrder(transactionData) {
 async function checkPendingOrders() {
   try {
     const pendingOrders = await sanityClient.fetch(
-      `*[_type == "purchase" && status == "Pending"]`
+      `*[_type == "tempOrder" && dateTime(expiresAt) > dateTime(now())]`
     );
 
-    console.log(`Checking ${pendingOrders.length} pending orders`);
+    console.log(`\nChecking ${pendingOrders.length} pending orders`);
 
     for (const order of pendingOrders) {
       try {
-        const response = await axios.get(
-          `https://api.onpay.io/v1/transaction/${order.onpayDetails.transactionId}`,
+        console.log(`\nChecking order: ${order.orderNumber}`);
+
+        const transactionsResponse = await axios.get(
+          "https://api.onpay.io/v1/transaction/",
           {
+            params: {
+              query: order.orderNumber,
+            },
             headers: {
               Authorization: `Bearer ${process.env.ONPAY_API_KEY}`,
               Accept: "application/json",
@@ -154,44 +236,96 @@ async function checkPendingOrders() {
           }
         );
 
-        const transactionData = response.data.data;
+        // Find matching transaktion
+        const transaction = transactionsResponse.data.data.find((tx) => {
+          const isMatch =
+            tx.order_id === order.orderNumber &&
+            tx.status === "active" &&
+            !tx.charged;
 
-        if (
-          transactionData.status === "captured" ||
-          transactionData.status === "active"
-        ) {
-          await updateOrCreateOrder(transactionData);
-        } else if (
-          ["declined", "aborted", "cancelled", "pre_auth"].includes(
-            transactionData.status
-          )
-        ) {
-          // Remove orders that are no longer pending and not captured or active
-          await sanityClient.delete(order._id);
+          console.log("Checking transaction:", {
+            transactionId: tx.uuid,
+            orderId: tx.order_id,
+            status: tx.status,
+            charged: tx.charged,
+            isMatch,
+          });
+
+          return isMatch;
+        });
+
+        if (transaction) {
           console.log(
-            `Deleted non-active/captured order: ${order.orderNumber}`
+            `Found matching transaction for order ${order.orderNumber}:`,
+            transaction
+          );
+
+          // Opret permanent order
+          const purchase = {
+            _type: "purchase",
+            orderNumber: order.orderNumber,
+            status: "authorized",
+            totalAmount: parseInt(transaction.amount) / 100,
+            currency: "DKK",
+            purchasedItems: order.items,
+            shippingInfo: order.shippingInfo,
+            onpayTransactionId: transaction.uuid,
+            onpayDetails: {
+              uuid: transaction.uuid,
+              amount: transaction.amount,
+              currency: transaction.currency_code,
+              method: transaction.wallet || "card",
+              status: transaction.status,
+            },
+            createdAt: order.createdAt,
+            updatedAt: new Date().toISOString(),
+          };
+
+          // Atomisk operation
+          await sanityClient
+            .transaction()
+            .create(purchase)
+            .delete(order._id)
+            .commit();
+
+          console.log(`Created purchase order: ${order.orderNumber}`);
+        } else {
+          console.log(
+            `No matching transaction found for order: ${order.orderNumber}`
           );
         }
       } catch (error) {
-        console.error(
-          `Error checking order ${order.orderNumber}:`,
-          error.message
-        );
+        console.error(`Error checking order ${order.orderNumber}:`, error);
+        if (error.response) {
+          console.error("OnPay API response:", error.response.data);
+        }
       }
     }
+
+    // Cleanup
+    const expired = await sanityClient.fetch(
+      `*[_type == "tempOrder" && dateTime(expiresAt) <= dateTime(now())]`
+    );
+
+    if (expired.length > 0) {
+      await sanityClient.delete({
+        query: `*[_type == "tempOrder" && dateTime(expiresAt) <= dateTime(now())]`,
+      });
+      console.log(`\nCleaned up ${expired.length} expired orders`);
+    }
   } catch (error) {
-    console.error("Error checking pending orders:", error.message);
+    console.error("\nError in checkPendingOrders:", error);
   }
 }
 
 function startPolling() {
-  console.log(
-    `Starting Onpay transaction polling service (Interval: ${POLLING_INTERVAL}ms)...`
-  );
-  pollTransactionEvents();
+  console.log("Starting payment monitoring service...");
 
   // Start checking pending orders periodically
   setInterval(checkPendingOrders, PENDING_CHECK_INTERVAL);
+
+  // Initial check
+  checkPendingOrders();
 }
 
-module.exports = { startPolling };
+module.exports = { startPolling, processPayment };

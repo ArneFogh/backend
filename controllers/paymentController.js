@@ -1,6 +1,6 @@
 const { sanityClient } = require("../sanityClient");
 const { calculateHmacSha1, sendAlertToTeam } = require("../utils/paymentUtils");
-const { v4: uuidv4 } = require("uuid");
+const ORDER_EXPIRY_TIME = 30 * 60 * 1000; // 30 minutes
 
 const pendingOrders = new Map();
 const orderLocks = new Map();
@@ -9,82 +9,38 @@ exports.preparePayment = async (req, res) => {
   const { orderNumber, totalWithShipping, items, userId, shippingInfo } =
     req.body;
 
-  if (!orderNumber || !totalWithShipping || !items || !userId) {
-    return res.status(400).json({
-      message: "Missing required fields",
-      details: "orderNumber, totalWithShipping, items, and userId are required",
-    });
-  }
-
-  // Implementer mutex/locking mekanisme
-  if (orderLocks.has(orderNumber)) {
-    return res.status(409).json({
-      message: "Order is being processed",
-      status: "locked",
-    });
-  }
-
-  orderLocks.set(orderNumber, true);
-
   try {
-    // Check for existing order i Sanity
-    const existingOrder = await sanityClient.fetch(
-      `*[_type == "purchase" && orderNumber == $orderNumber][0]`,
-      { orderNumber }
-    );
-
-    if (existingOrder) {
-      return res.status(409).json({
-        message: "Order already exists",
-        onPayParams: null,
-      });
-    }
-
-    // Check for existing pending order
-    if (pendingOrders.has(orderNumber)) {
-      return res.status(409).json({
-        message: "Order is already pending",
-        onPayParams: null,
-      });
-    }
-
-    // Prepare OnPay parameters
-    const currency = "DKK";
-    const amount = Math.round(totalWithShipping * 100).toString();
+    // Sikr at orderNumber er i uppercase
+    const formattedOrderNumber = orderNumber.toUpperCase();
 
     const params = {
       onpay_gatewayid: process.env.ONPAY_GATEWAY_ID,
-      onpay_currency: currency,
-      onpay_amount: amount,
-      onpay_reference: orderNumber,
-      onpay_accepturl: `${process.env.FRONTEND_URL}/order-confirmation/${orderNumber}`,
+      onpay_currency: "208",
+      onpay_amount: Math.round(totalWithShipping * 100).toString(),
+      onpay_reference: formattedOrderNumber,
+      onpay_accepturl: `${process.env.FRONTEND_URL}/order-confirmation/${formattedOrderNumber}`,
       onpay_callbackurl: `${process.env.BACKEND_URL}/api/payment-callback`,
-      onpay_declineurl: `${process.env.FRONTEND_URL}/payment-failed/${orderNumber}`,
+      onpay_declineurl: `${process.env.FRONTEND_URL}/payment-failed/${formattedOrderNumber}`,
     };
 
     const hmacSha1 = calculateHmacSha1(params, process.env.ONPAY_SECRET);
+    console.log("HMAC params:", params);
+    console.log("Generated HMAC:", hmacSha1);
 
-    // Store pending order data
-    const purchase = {
-      _type: "purchase",
-      orderNumber,
+    // Opret tempOrder med uppercase orderNumber
+    const tempOrder = {
+      _type: "tempOrder",
+      orderNumber: formattedOrderNumber,
       status: "pending",
+      items,
       totalAmount: totalWithShipping,
-      currency: "DKK",
-      createdAt: new Date().toISOString(),
-      purchasedItems: items,
+      userId,
       shippingInfo,
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
     };
 
-    // Store i pending orders
-    pendingOrders.set(orderNumber, purchase);
-
-    // Setup cleanup after 30 minutes
-    setTimeout(() => {
-      pendingOrders.delete(orderNumber);
-    }, 30 * 60 * 1000);
-
-    console.log(`Stored pending order: ${orderNumber}`);
+    await sanityClient.create(tempOrder);
 
     res.json({
       ...params,
@@ -96,8 +52,6 @@ exports.preparePayment = async (req, res) => {
       message: "Internal server error",
       error: error.message,
     });
-  } finally {
-    orderLocks.delete(orderNumber);
   }
 };
 
@@ -146,40 +100,14 @@ exports.updateOrderStatus = async (req, res) => {
   const { orderNumber, status, onpayDetails } = req.body;
   console.log("Updating order status:", { orderNumber, status, onpayDetails });
 
-  if (!orderNumber) {
-    return res.status(400).json({ message: "Order number is required" });
-  }
-
   try {
-    // Check pending orders først
-    const pendingOrder = pendingOrders.get(orderNumber);
-
-    if (pendingOrder) {
-      // Opret ordren i Sanity hvis den var pending
-      const newOrder = await sanityClient.create({
-        ...pendingOrder,
-        status: status,
-        onpayDetails,
-        updatedAt: new Date().toISOString(),
-      });
-
-      // Fjern fra pending orders
-      pendingOrders.delete(orderNumber);
-
-      console.log("Created new order from pending:", newOrder);
-      return res.json({
-        status: newOrder.status,
-        orderDetails: newOrder,
-      });
-    }
-
-    // Hvis ikke i pending orders, check Sanity
-    const existingOrder = await sanityClient.fetch(
-      `*[_type == "purchase" && orderNumber == $orderNumber][0]`,
+    // Check både tempOrder og purchase collections
+    const order = await sanityClient.fetch(
+      `*[(_type == "tempOrder" || _type == "purchase") && orderNumber == $orderNumber][0]`,
       { orderNumber }
     );
 
-    if (!existingOrder) {
+    if (!order) {
       console.log(`No order found with number: ${orderNumber}`);
       return res.status(404).json({
         message: "Order not found",
@@ -187,27 +115,54 @@ exports.updateOrderStatus = async (req, res) => {
       });
     }
 
-    // Opdater eksisterende ordre
-    const updatedOrder = await sanityClient
-      .patch(existingOrder._id)
-      .set({
-        status,
-        onpayDetails,
+    if (order._type === "tempOrder") {
+      // Konverter tempOrder til permanent order
+      const purchase = {
+        _type: "purchase",
+        orderNumber,
+        status: status,
         totalAmount: parseInt(onpayDetails.onpay_amount) / 100,
         currency:
           onpayDetails.onpay_currency === "208"
             ? "DKK"
             : onpayDetails.onpay_currency,
+        purchasedItems: order.items,
+        shippingInfo: order.shippingInfo,
+        onpayDetails,
+        createdAt: order.createdAt,
         updatedAt: new Date().toISOString(),
-      })
-      .commit();
+      };
 
-    console.log("Updated existing order:", updatedOrder);
+      // Brug transaction til at sikre atomisk operation
+      const transaction = sanityClient.transaction();
+      transaction.create(purchase);
+      transaction.delete(order._id);
+      await transaction.commit();
 
-    res.json({
-      status: updatedOrder.status,
-      orderDetails: updatedOrder,
-    });
+      console.log("Created purchase from tempOrder:", purchase);
+
+      return res.json({
+        status: purchase.status,
+        orderDetails: purchase,
+      });
+    } else {
+      // Opdater eksisterende order
+      const updatedOrder = await sanityClient
+        .patch(order._id)
+        .set({
+          status,
+          onpayDetails,
+          updatedAt: new Date().toISOString(),
+        })
+        .commit();
+
+      console.log("Updated existing order:", updatedOrder);
+
+      return res.json({
+        status: updatedOrder.status,
+        orderDetails: updatedOrder,
+      });
+    }
   } catch (error) {
     console.error("Error updating order status:", error);
     res.status(500).json({
@@ -221,12 +176,7 @@ exports.handlePaymentCallback = async (req, res) => {
   console.log("Received callback from OnPay:", req.body);
 
   try {
-    const {
-      onpay_reference: orderNumber,
-      onpay_amount: amount,
-      onpay_currency: currency,
-      onpay_errorcode: errorCode,
-    } = req.body;
+    const { onpay_reference: orderNumber } = req.body;
 
     // Verify HMAC
     const calculatedHmac = calculateHmacSha1(
@@ -237,26 +187,7 @@ exports.handlePaymentCallback = async (req, res) => {
       throw new Error("Invalid HMAC");
     }
 
-    // Check pending orders først
-    const pendingOrder = pendingOrders.get(orderNumber);
-
-    if (pendingOrder) {
-      // Opret ordren i Sanity
-      const purchase = await sanityClient.create({
-        ...pendingOrder,
-        status: errorCode === "0" ? "success" : "failed",
-        totalAmount: parseInt(amount) / 100,
-        currency: currency === "208" ? "DKK" : currency,
-        updatedAt: new Date().toISOString(),
-        onpayDetails: req.body,
-      });
-
-      // Fjern fra pending orders
-      pendingOrders.delete(orderNumber);
-
-      console.log(`Created purchase in Sanity: ${purchase._id}`);
-    }
-
+    await processPayment(req.body);
     res.status(200).send("OK");
   } catch (error) {
     console.error("Error processing callback:", error);

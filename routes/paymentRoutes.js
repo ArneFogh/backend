@@ -4,7 +4,7 @@ const paymentController = require("../controllers/paymentController");
 
 router.post("/prepare-payment", paymentController.preparePayment);
 router.get("/verify-payment", paymentController.verifyPayment);
-router.post("/update-order-status", paymentController.updateOrderStatus);
+router.post("/update-order-status", paymentController.updateOrderStatus);  // Dette endpoint giver 404
 router.post("/payment-callback", paymentController.handlePaymentCallback);
 router.get("/order-status/:orderNumber", paymentController.getOrderStatus);
 

@@ -14,6 +14,8 @@ exports.calculateHmacSha1 = (params, secret) => {
     .join("&")
     .toLowerCase();
 
+  console.log("HMAC input string:", queryString); // For debugging
+
   const hmac = crypto.createHmac("sha1", secret);
   hmac.update(queryString);
   return hmac.digest("hex");
