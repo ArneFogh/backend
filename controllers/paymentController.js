@@ -7,8 +7,15 @@ const pendingOrders = new Map();
 const orderLocks = new Map();
 
 exports.preparePayment = async (req, res) => {
-  const { orderNumber, totalWithShipping, items, userId, shippingInfo } =
-    req.body;
+  const {
+    orderNumber,
+    totalWithShipping,
+    items,
+    userId,
+    shippingInfo,
+    billingInfo,
+    sameAsShipping,
+  } = req.body;
 
   try {
     const formattedOrderNumber = orderNumber.toUpperCase();
@@ -24,16 +31,14 @@ exports.preparePayment = async (req, res) => {
     };
 
     const hmacSha1 = calculateHmacSha1(params, process.env.ONPAY_SECRET);
-    console.log("HMAC params:", params);
-    console.log("Generated HMAC:", hmacSha1);
 
-    // Opret tempOrder med alle påkrævede felter
+    // Opret tempOrder med alle påkrævede felter inklusive billing information
     const tempOrder = {
       _type: "tempOrder",
       orderNumber: formattedOrderNumber,
       status: "pending",
       items: items.map((item) => ({
-        _key: item._key || uuidv4(), // Brug eksisterende _key eller generer ny
+        _key: item._key || uuidv4(),
         productId: item.productId,
         productName: item.productName,
         quantity: item.quantity,
@@ -49,6 +54,15 @@ exports.preparePayment = async (req, res) => {
         email: shippingInfo.email,
         country: shippingInfo.country,
       },
+      billingInfo: {
+        fullName: billingInfo.fullName,
+        address: billingInfo.address,
+        city: billingInfo.city,
+        postalCode: billingInfo.postalCode,
+        email: billingInfo.email,
+        country: billingInfo.country,
+      },
+      sameAsShipping,
       createdAt: new Date().toISOString(),
       expiresAt: new Date(Date.now() + ORDER_EXPIRY_TIME).toISOString(),
     };
