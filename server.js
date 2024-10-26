@@ -10,6 +10,7 @@ const userRoutes = require("./routes/userRoutes");
 const productRoutes = require("./routes/productRoutes");
 const contentRoutes = require("./routes/contentRoutes");
 const paymentRoutes = require("./routes/paymentRoutes");
+const shippingRoutes = require("./routes/shippingRoutes");
 
 validateEnvVariables();
 
@@ -37,6 +38,7 @@ app.use("/api/users", userRoutes);
 app.use("/api/products", productRoutes);
 app.use("/api", contentRoutes);
 app.use("/api", paymentRoutes);
+app.use("/api", shippingRoutes);
 
 process.on("uncaughtException", (error) => {
   console.error("Uncaught Exception:", error);
