@@ -4,6 +4,7 @@ const bodyParser = require("body-parser");
 const { validateEnvVariables } = require("./config/envConfig");
 const corsMiddleware = require("./middleware/corsMiddleware");
 const loggingMiddleware = require("./middleware/loggingMiddleware");
+const { handleAuthError } = require('./middleware/auth');
 const onpayService = require("./services/onpayService");
 
 const userRoutes = require("./routes/userRoutes");
@@ -11,6 +12,8 @@ const productRoutes = require("./routes/productRoutes");
 const contentRoutes = require("./routes/contentRoutes");
 const paymentRoutes = require("./routes/paymentRoutes");
 const shippingRoutes = require("./routes/shippingRoutes");
+const userPostRoutes = require('./routes/userPostRoutes');
+
 
 validateEnvVariables();
 
@@ -29,6 +32,7 @@ app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.json());
 app.use(loggingMiddleware);
+app.use(express.urlencoded({ extended: true }));
 
 app.get("/", (req, res) => {
   res.send("Backend is running!");
@@ -39,6 +43,9 @@ app.use("/api/products", productRoutes);
 app.use("/api", contentRoutes);
 app.use("/api", paymentRoutes);
 app.use("/api", shippingRoutes);
+app.use('/api/user-posts', userPostRoutes);
+app.use(handleAuthError);
+
 
 process.on("uncaughtException", (error) => {
   console.error("Uncaught Exception:", error);
