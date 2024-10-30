@@ -53,10 +53,15 @@ exports.getUserPosts = async (req, res) => {
 exports.createUserPost = async (req, res) => {
   try {
     console.log("Received create post request");
-    console.log("Auth info:", {
-      user: req.auth,
-      headers: req.headers,
-    });
+    console.log("User info from request:", req.user);
+
+    if (!req.user || !req.user.sub) {
+      console.error("No user info found in request");
+      return res.status(401).json({
+        message: "User ID not found in request",
+        debug: { user: req.user },
+      });
+    }
 
     upload.array("images", 10)(req, res, async (err) => {
       if (err) {
@@ -67,14 +72,22 @@ exports.createUserPost = async (req, res) => {
       try {
         const { title, description, price } = req.body;
         const contactInfo = JSON.parse(req.body.contactInfo);
-        const userId = req.auth?.sub; // Auth0 user ID
+        const userId = req.user.sub; // Get user ID from req.user instead of req.auth
 
-        console.log("Processing post data:", {
-          title,
-          description,
-          userId,
-          filesCount: req.files?.length,
+        console.log("Processing post with user ID:", userId);
+
+        // Fetch user details from Sanity
+        const userQuery = '*[_type == "user" && auth0Id == $auth0Id][0]';
+        const userDoc = await sanityClient.fetch(userQuery, {
+          auth0Id: userId,
         });
+
+        if (!userDoc) {
+          console.error("User not found in Sanity:", userId);
+          return res.status(404).json({ message: "User not found" });
+        }
+
+        console.log("Found user doc:", userDoc);
 
         // Upload images to Sanity
         const imageAssets = await Promise.all(
@@ -105,9 +118,15 @@ exports.createUserPost = async (req, res) => {
           featuredImage: imageAssets[0],
           images: imageAssets.slice(1),
           contactInfo,
-          userId,
+          userId: userId,
+          createdBy: userDoc.username || userDoc.email || "Unknown User",
           createdAt: new Date().toISOString(),
         };
+
+        console.log("Creating document with data:", {
+          ...doc,
+          images: `${imageAssets.length} images`,
+        });
 
         const result = await sanityClient.create(doc);
         console.log("Post created successfully:", result._id);
@@ -173,7 +192,6 @@ exports.updateUserPost = async (req, res) => {
     }
 
     const result = await sanityClient.patch(id).set(updates).commit();
-
     res.json(result);
   } catch (error) {
     console.error("Error updating user post:", error);

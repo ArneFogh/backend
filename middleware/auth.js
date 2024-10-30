@@ -1,4 +1,5 @@
 const { auth } = require("express-oauth2-jwt-bearer");
+const jwt = require("jsonwebtoken");
 
 const checkJwt = auth({
   audience: process.env.AUTH0_AUDIENCE,
@@ -6,7 +7,6 @@ const checkJwt = auth({
   tokenSigningAlg: "RS256",
 });
 
-// Middleware to extract the auth token
 const extractAuthToken = (req, res, next) => {
   const authHeader = req.headers.authorization;
 
@@ -21,14 +21,41 @@ const extractAuthToken = (req, res, next) => {
     return res.status(401).json({ message: "No token provided" });
   }
 
-  console.log("Token extracted successfully");
-  req.token = token;
-  next();
+  try {
+    // Decode token to get user info without verifying (verification is done by checkJwt)
+    const decoded = jwt.decode(token);
+
+    if (!decoded || !decoded.sub) {
+      console.log("Invalid token structure:", decoded);
+      return res.status(401).json({ message: "Invalid token structure" });
+    }
+
+    // Store only the necessary information
+    req.user = {
+      sub: decoded.sub,
+      scope: decoded.scope,
+    };
+
+    console.log("Token decoded successfully:", {
+      sub: decoded.sub,
+      scope: decoded.scope,
+    });
+
+    next();
+  } catch (error) {
+    console.error("Error decoding token:", error);
+    return res.status(401).json({ message: "Invalid token format" });
+  }
 };
 
-// Error handling middleware
 const handleAuthError = (err, req, res, next) => {
-  console.error("Auth Error:", err);
+  console.error("Auth Error:", {
+    name: err.name,
+    message: err.message,
+    code: err.code,
+    statusCode: err.statusCode,
+  });
+
   if (err.name === "UnauthorizedError") {
     return res.status(401).json({
       message: "Invalid token",
