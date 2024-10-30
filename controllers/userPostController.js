@@ -1,5 +1,6 @@
 const { sanityClient } = require("../sanityClient");
 const multer = require("multer");
+
 const upload = multer({ storage: multer.memoryStorage() });
 
 exports.getAllUserPosts = async (req, res) => {
@@ -50,56 +51,82 @@ exports.getUserPosts = async (req, res) => {
 };
 
 exports.createUserPost = async (req, res) => {
-  upload.array("images", 10)(req, res, async (err) => {
-    if (err) {
-      return res.status(400).json({ message: "Error uploading files" });
-    }
+  try {
+    console.log("Received create post request");
+    console.log("Auth info:", {
+      user: req.auth,
+      headers: req.headers,
+    });
 
-    try {
-      const { title, description, price } = req.body;
-      const contactInfo = JSON.parse(req.body.contactInfo);
-      const userId = req.auth?.sub; // Auth0 user ID
+    upload.array("images", 10)(req, res, async (err) => {
+      if (err) {
+        console.error("Multer error:", err);
+        return res.status(400).json({ message: "Error uploading files" });
+      }
 
-      // Upload images to Sanity
-      const imageAssets = await Promise.all(
-        req.files.map(async (file) => {
-          const assetRef = await sanityClient.assets.upload(
-            "image",
-            file.buffer,
-            {
-              filename: file.originalname,
-              contentType: file.mimetype,
-            }
-          );
-          return {
-            _type: "image",
-            asset: {
-              _type: "reference",
-              _ref: assetRef._id,
-            },
-          };
-        })
-      );
+      try {
+        const { title, description, price } = req.body;
+        const contactInfo = JSON.parse(req.body.contactInfo);
+        const userId = req.auth?.sub; // Auth0 user ID
 
-      const doc = {
-        _type: "userPost",
-        title,
-        description,
-        price,
-        featuredImage: imageAssets[0],
-        images: imageAssets.slice(1),
-        contactInfo,
-        userId,
-        createdAt: new Date().toISOString(),
-      };
+        console.log("Processing post data:", {
+          title,
+          description,
+          userId,
+          filesCount: req.files?.length,
+        });
 
-      const result = await sanityClient.create(doc);
-      res.json(result);
-    } catch (error) {
-      console.error("Error creating user post:", error);
-      res.status(500).json({ message: "Failed to create user post" });
-    }
-  });
+        // Upload images to Sanity
+        const imageAssets = await Promise.all(
+          (req.files || []).map(async (file) => {
+            const assetRef = await sanityClient.assets.upload(
+              "image",
+              file.buffer,
+              {
+                filename: file.originalname,
+                contentType: file.mimetype,
+              }
+            );
+            return {
+              _type: "image",
+              asset: {
+                _type: "reference",
+                _ref: assetRef._id,
+              },
+            };
+          })
+        );
+
+        const doc = {
+          _type: "userPost",
+          title,
+          description,
+          price,
+          featuredImage: imageAssets[0],
+          images: imageAssets.slice(1),
+          contactInfo,
+          userId,
+          createdAt: new Date().toISOString(),
+        };
+
+        const result = await sanityClient.create(doc);
+        console.log("Post created successfully:", result._id);
+        res.json(result);
+      } catch (error) {
+        console.error("Error in post creation:", error);
+        res.status(500).json({
+          message: "Failed to create user post",
+          error: error.message,
+        });
+      }
+    });
+  } catch (error) {
+    console.error("Controller error:", error);
+    res.status(500).json({
+      message: "Server error",
+      error: error.message,
+    });
+  }
 };
 
 exports.deleteUserPost = async (req, res) => {
