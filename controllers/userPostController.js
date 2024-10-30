@@ -151,12 +151,23 @@ exports.createUserPost = async (req, res) => {
 exports.deleteUserPost = async (req, res) => {
   try {
     const { id } = req.params;
-    const userId = req.auth?.sub;
+    const userId = req.user?.sub; // Changed from req.auth to req.user
 
-    // Check if the post exists and belongs to the user
+    if (!userId) {
+      return res.status(401).json({
+        message: "Unauthorized: User ID not found",
+      });
+    }
+
+    console.log("Attempting to delete post:", { postId: id, userId });
+
+    // First fetch the post to check ownership
     const post = await sanityClient.fetch(
       `*[_type == "userPost" && _id == $id && userId == $userId][0]`,
-      { id, userId }
+      {
+        id,
+        userId,
+      }
     );
 
     if (!post) {
@@ -165,11 +176,15 @@ exports.deleteUserPost = async (req, res) => {
       });
     }
 
+    // If we reach here, the user owns the post and we can delete it
     await sanityClient.delete(id);
     res.json({ message: "Post deleted successfully" });
   } catch (error) {
     console.error("Error deleting user post:", error);
-    res.status(500).json({ message: "Failed to delete user post" });
+    res.status(500).json({
+      message: "Failed to delete user post",
+      error: error.message,
+    });
   }
 };
 
