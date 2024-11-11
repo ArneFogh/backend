@@ -1,4 +1,9 @@
 require("dotenv").config();
+console.log('Checking Auth0 Management API configuration:', {
+  domain: process.env.AUTH0_DOMAIN ? 'Set' : 'NOT SET',
+  clientId: process.env.AUTH0_MANAGEMENT_CLIENT_ID ? 'Set' : 'NOT SET',
+  clientSecret: process.env.AUTH0_MANAGEMENT_CLIENT_SECRET ? 'Set' : 'NOT SET',
+});
 const express = require("express");
 const cors = require("cors");
 const { auth } = require("express-oauth2-jwt-bearer");
